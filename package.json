@@ -12,7 +12,9 @@
     "test:watch": "vitest",
     "test:debug": "vitest run --inspect-brk --no-file-parallelism",
     "dual": "node scripts/quick-dual-test.mjs",
-    "host-ai": "node scripts/ai-host.mjs"
+    "host-ai": "node scripts/ai-host.mjs",
+    "net:tunnel": "node scripts/net-tunnel.mjs",
+    "net:latency": "node scripts/net-latency.mjs"
   },
   "dependencies": {
     "ws": "^8.21.0"

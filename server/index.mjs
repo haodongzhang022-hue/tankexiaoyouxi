@@ -23,6 +23,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DIST_DIR = path.resolve(__dirname, "..", "dist");
 
 const PORT = parseInt(process.env.PORT || "3001", 10);
+// 监听地址：默认 0.0.0.0（容器/端口预览代理回源需要），可用 HOST=127.0.0.1 收紧到本机
+const HOST = process.env.HOST || "0.0.0.0";
 const MAX_SEATS = 4;
 
 // ── 静态文件服务（dist/）─────────────────────────────────────────
@@ -596,7 +598,7 @@ process.on("unhandledRejection", (reason) => {
   console.error(`[unhandledRejection] 已捕获，服务继续运行: ${reason}`);
 });
 
-httpServer.listen(PORT, () => {
+httpServer.listen(PORT, HOST, () => {
   const nets = os.networkInterfaces();
   const lanIps = [];
   for (const list of Object.values(nets)) {
@@ -607,6 +609,15 @@ httpServer.listen(PORT, () => {
   console.log(`[坦克大战联机] 服务器已启动（页面 + WebSocket 同端口）`);
   console.log(`  本机游玩:   http://localhost:${PORT}`);
   for (const ip of lanIps) console.log(`  局域网分享: http://${ip}:${PORT}`);
+  console.log(`  监听地址:   ${HOST}:${PORT}`);
+  // 云原生开发（CNB）会注入端口预览模板 https://<环境ID>-{{port}}.cnb.run，
+  // 直接把 {{port}} 替换成端口就是公网分享地址（页面与 WS 同源，一个链接即可联机）。
+  const proxyTpl = process.env.CNB_VSCODE_PROXY_URI || process.env.CNB_VSCODE_PROXY_URI_HTTPS || process.env.CNB_PROXY_URI || process.env.CNB_PORT_PREVIEW_URI;
+  if (proxyTpl) {
+    const pub = proxyTpl.replace(/\{\{port\}\}/g, String(PORT)).replace(/\/$/, '');
+    console.log(`  公网分享:   ${pub}   ← 直接发给好友，打开即进大厅`);
+    console.log(`  延迟自测:   npm run net:latency -- ${pub}`);
+  }
   console.log(`  外网分享:   用路由器端口转发 / ngrok / frp / Cloudflare Tunnel 暴露 ${PORT} 端口后，把公网地址发给好友`);
   console.log(`  提示: 若提示没有游戏页面，请先在项目目录执行 npm run build`);
 });
