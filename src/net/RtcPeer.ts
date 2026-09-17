@@ -3,11 +3,22 @@
 //  原则与约束：
 //    - 信令仍走现有 WS 中继（服务器仅转发 rtc_signal 给目标 clientId，不感知内容）；
 //    - 不做 STUN/TURN（公网跨 NAT 不保证连通）→ 连通失败自动保持 WS 兜底，游戏不受影响；
+//    - 环境变量 VITE_ICE_SERVERS（如 "stun:stun.qq.com" 逗号分隔）可注入 STUN 服务器；
+//      两端都配置时公网 P2P 直连成功率更高（快照少走一跳中继，实测再降 RTT）；
+//      不配置则行为与原来完全一致（纯直连，失败回落 WS）；
 //    - 快照"双发"：WS 兜底 + P2P（P2P 帧先到即先渲染，成员端按帧号天然去重）。
 export type RtcRole = "host" | "member";
 export type RtcState = "idle" | "negotiating" | "connected" | "failed" | "closed";
 
 const ICE_TIMEOUT_MS = 900; // host 候选收集超时限（同机/局域网足够）
+
+/** ICE 服务器（可选）：VITE_ICE_SERVERS="stun:stun.qq.com,stun:stun.cloudflare.com"；留空=纯直连 */
+const ICE_SERVERS: RTCIceServer[] = (() => {
+  try {
+    const raw = (import.meta as { env?: Record<string, string> }).env?.VITE_ICE_SERVERS || "";
+    return raw.split(",").map((s) => s.trim()).filter(Boolean).map((urls) => ({ urls }));
+  } catch { return []; }
+})();
 
 export class RtcPeer {
   state: RtcState = "idle";
@@ -31,7 +42,7 @@ export class RtcPeer {
     if (this.state !== "idle") return this.state;
     this.state = "negotiating";
     try {
-      this.pc = new RTCPeerConnection({ iceServers: [] }); // 纯直连：局域网/同机；公网靠 STUN 未配置 → 失败即回落
+      this.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS }); // 默认纯直连；配置 VITE_ICE_SERVERS 后公网更易连通
       this.pc.onicecandidate = (e) => {
         if (e.candidate) this.sendSignal(this.peerId, { kind: "ice", candidate: e.candidate.toJSON() });
       };

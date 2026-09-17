@@ -1,15 +1,31 @@
-# 腾讯 CNB 云原生开发流水线（坦克大战联机测试）
-# 用途：点分支页「云原生开发」→ 用 node:20 容器自动装依赖、构建 dist、后台起 WS 服务（端口 3001）
-# 进入 WebIDE 后在 PORTS 面板映射 3001 取 cnb.run 预览 URL（标准模式；onlyPreview 不支持代理转发）
+# 腾讯 CNB 云原生开发流水线（坦克大战联机 · 云原生开发当公网服务器）
+#
+# 目的：把联机服务器（页面 + WebSocket 同端口 3001）直接跑在 CNB 云原生开发环境里，
+#       用平台的端口预览（CNB_VSCODE_PROXY_URI，形如 https://<env>-3001.cnb.run）
+#       做公网入口，取代 cpolar 内网穿透（旧链路实测 600ms+）。
+#
+# 用法：
+#   1. 点分支页「云原生开发」→ 环境就绪后，dist 已构建、服务器已在 3001 监听（0.0.0.0）；
+#   2. PORTS 面板映射 3001，或直接访问 https://<env>-3001.cnb.run ；
+#      IDE 里跑 `npm run net:tunnel` 可打印当前公网地址并批量测延迟；
+#   3. 实测延迟：`npm run net:latency -- wss://<env>-3001.cnb.run`（中继 RTT，往返 ms）。
+#
+# 注意：
+#   - 服务必须监听 0.0.0.0（server/index.mjs 已如此），监听 127.0.0.1 无法被预览代理访问；
+#   - 预览代理需要 HTTP/WS 走同一个 Host/端口，页面与 WS 同源即可直接连通（客户端已同源优先）；
+#   - 这里的 stages 只装依赖/构建/起服务，不要占用 3001，避免与服务器抢端口。
 $:
   vscode:
-    - docker:
+    - runner:
+        cpus: 4
+      docker:
         image: node:20
       services:
         - vscode
         - docker
       env:
         PORT: "3001"
+        HOST: "0.0.0.0"
       stages:
         - name: install-deps
           script: npm ci
@@ -17,6 +33,53 @@ $:
           script: npm run build
         - name: start-tank-server
           script:
+            - pkill -f "node server/index.mjs" || true
             - nohup node server/index.mjs > /tmp/tank-server.log 2>&1 &
             - sleep 2
             - cat /tmp/tank-server.log
+            # 自检：本机 3001 必须 HTTP 200，否则构建直接失败（避免"环境起来了但服务没起"）
+            - |
+              code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3001/ || true)
+              echo "本机 3001 自检 HTTP=$code"
+              [ "$code" = "200" ] || { echo "服务器未就绪"; exit 1; }
+            - |
+              echo "公网预览地址: ${CNB_VSCODE_PROXY_URI//\{\{port\}\}/3001}"
+              echo "延迟实测:     npm run net:latency -- ${CNB_VSCODE_PROXY_URI//\{\{port\}\}/3001}"
+
+# ── Issue/PR 里 @NPC 触发：在云原生环境起服务器并做端口预览自检 + 延迟实测 ──
+# 触发：在本仓库 Issue/PR 评论里 @CodeBuddy（npc 事件），本流水线会自动跑一遍。
+# 目的：验证"云原生开发当公网服务器"这条新通道是否可用、延迟多少，产出一份可复现的报告。
+issue.comment@npc:
+  - runner:
+      cpus: 4
+    docker:
+      image: node:20
+    env:
+      PORT: "3001"
+      HOST: "0.0.0.0"
+    stages:
+      - name: install-deps
+        script: npm ci
+      - name: build-dist
+        script: npm run build
+      - name: start-server-and-selfcheck
+        script:
+          - pkill -f "node server/index.mjs" || true
+          - nohup node server/index.mjs > /tmp/tank-server.log 2>&1 &
+          - sleep 2
+          - cat /tmp/tank-server.log
+          - |
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3001/ || true)
+            ws=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3001/?room=1 || true)
+            echo "本机 3001 自检: / => $code, /?room=1 => $ws"
+            [ "$code" = "200" ] || { echo "服务器未就绪"; exit 1; }
+      - name: tunnel-latency-report
+        script:
+          - node scripts/net-tunnel.mjs
+          - |
+            if [ -n "$CNB_VSCODE_PROXY_URI" ]; then
+              node scripts/net-latency.mjs "${CNB_VSCODE_PROXY_URI//\{\{port\}\}/3001}" || true
+            else
+              echo "无 CNB_VSCODE_PROXY_URI：仅本机基线（见下）"
+              node scripts/net-latency.mjs http://127.0.0.1:3001 || true
+            fi

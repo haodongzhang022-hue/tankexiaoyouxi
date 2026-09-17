@@ -131,6 +131,7 @@ function learnPublicHost(hostHeader) {
   if (!h || h === "localhost" || h === "127.0.0.1" || h === "0.0.0.0" || h === "::1") return;
   if (/^(\d{1,3}\.){3}\d{1,3}$/.test(h)) return;                // 纯 IP 不学（要域名）
   if (/^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h)) return; // 私网不学
+  // 端口预览地址形如 j3sxxxx-3001.cnb.run → 好友需访问带端口的那个域名，这里保留原样
   publicHost = h;
   console.log("[动态适配] 学习到公网入口域名: " + h);
 }
@@ -596,7 +597,19 @@ process.on("unhandledRejection", (reason) => {
   console.error(`[unhandledRejection] 已捕获，服务继续运行: ${reason}`);
 });
 
-httpServer.listen(PORT, () => {
+// ── CNB 云原生开发：端口预览公网入口（取代 cpolar 内网穿透）──────
+// 平台在环境里注入 CNB_VSCODE_PROXY_URI（形如 https://j3sxxxx-{{port}}.cnb.run），
+// 把 {{port}} 换成实际端口即得该端口的公网 URL。服务器启动时打印出来，方便直接分享。
+function previewUrl(port) {
+  const tpl = process.env.CNB_VSCODE_PROXY_URI || "";
+  if (!tpl) return "";
+  return tpl.replace(/\{\{port\}\}/g, String(port)).replace(/\/$/, "");
+}
+
+// 服务必须监听 0.0.0.0：仅监听 127.0.0.1 时预览代理无法回源（云原生开发/容器皆然）
+const HOST = process.env.HOST || "0.0.0.0";
+
+httpServer.listen(PORT, HOST, () => {
   const nets = os.networkInterfaces();
   const lanIps = [];
   for (const list of Object.values(nets)) {
@@ -607,6 +620,13 @@ httpServer.listen(PORT, () => {
   console.log(`[坦克大战联机] 服务器已启动（页面 + WebSocket 同端口）`);
   console.log(`  本机游玩:   http://localhost:${PORT}`);
   for (const ip of lanIps) console.log(`  局域网分享: http://${ip}:${PORT}`);
-  console.log(`  外网分享:   用路由器端口转发 / ngrok / frp / Cloudflare Tunnel 暴露 ${PORT} 端口后，把公网地址发给好友`);
+  const pub = previewUrl(PORT);
+  if (pub) {
+    console.log(`  公网分享:   ${pub}   （CNB 端口预览，好友直接打开即可联机）`);
+    console.log(`  实测延迟:   npm run net:latency -- ${pub}`);
+  } else {
+    console.log(`  外网分享:   用路由器端口转发 / ngrok / frp / Cloudflare Tunnel 暴露 ${PORT} 端口后，把公网地址发给好友`);
+    console.log(`             （在 CNB 云原生开发环境里跑则用 PORTS 面板映射 ${PORT}，公网地址会自动打印）`);
+  }
   console.log(`  提示: 若提示没有游戏页面，请先在项目目录执行 npm run build`);
 });
