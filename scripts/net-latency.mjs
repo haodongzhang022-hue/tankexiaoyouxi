@@ -1,12 +1,18 @@
 //  scripts/net-latency.mjs ─ 延迟实测（HTTP 首字节 + WS 握手 + 中继 ping/pong RTT）
 //
-//  用途：把 cpolar 内网穿透换成 CNB 端口预览后，量化"公网入口到底快了多少"。
+//  用途：量化"公网入口到底快了多少"，直接对比 cpolar 的 ≈600ms。
 //        输出的 WS 中继 RTT 与游戏内 HUD 同一口径，可直接对比。
 //
 //  用法：
-//    npm run net:latency -- https://<环境ID>-3001.cnb.run    公网入口
+//    npm run net:latency -- http://<服务器IP>:3001           常驻服务器入口（推荐）
 //    npm run net:latency -- http://127.0.0.1:3001            本机回环基线
-//    npm run net:latency -- https://a.cnb.run http://127.0.0.1:3001   一次跑两个并对比
+//    npm run net:latency -- A B                              一次跑两个并对比
+//
+//  ⚠ CNB 云原生开发的端口预览地址（https://<环境ID>-3001.cnb.run）**不要**再用来测：
+//     环境一回收该地址就 302 跳回 cnb.cool（因为它是通配域名，环境不存在时统一跳首页），
+//     测出来的"延迟"是跳转的延迟，不是游戏链路的延迟。
+//     本脚本检测到 302/3xx 会直接判为「地址已失效」并给出正确做法。
+//     常驻入口请见 deploy/README.md。
 //
 //  环境变量：SAMPLES=20（ping 样本数，默认 20）
 import { WebSocket } from "ws";
@@ -35,8 +41,19 @@ async function httpTiming(base) {
   for (let i = 0; i < 3; i++) {
     const t = performance.now();
     try {
-      const res = await fetch(base + "/", { cache: "no-store" });
+      const res = await fetch(base + "/", { cache: "no-store", redirect: "manual" });
       await res.arrayBuffer();
+      // 3xx：多半是端口预览地址已随环境回收失效（cnb.run 通配域名会 302 跳 cnb.cool）
+      if (res.status >= 300 && res.status < 400) {
+        const to = res.headers.get("location") || "?";
+        console.log(`    HTTP #${i + 1} ${res.status} → ${to}`);
+        console.log(`    ✗ 该地址不是游戏服务（重定向到 ${to}），延迟数字无意义`);
+        return null;
+      }
+      if (res.status !== 200) {
+        console.log(`    HTTP #${i + 1} ${res.status}（非 200，可能服务没起）`);
+        return null;
+      }
       out.push(performance.now() - t);
       console.log(`    HTTP #${i + 1} ${res.status} ${out[out.length - 1].toFixed(0)}ms`);
     } catch (e) {

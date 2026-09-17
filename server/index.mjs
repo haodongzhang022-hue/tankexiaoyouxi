@@ -70,6 +70,19 @@ const httpServer = http.createServer((req, res) => {
   let urlPath;
   try { urlPath = decodeURIComponent(new URL(req.url, "http://x").pathname); }
   catch { sendHtml(res, 400, "bad request"); return; }
+  // 健康检查（供 Docker HEALTHCHECK / 云负载均衡 / 你自己 curl 用）
+  // 与 "/" 的区别：这里只证明**服务进程活着**，不关心 dist 是否构建，返回极小的 JSON。
+  if (urlPath === "/healthz") {
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+    res.end(JSON.stringify({ ok: true, service: "tank-online", port: PORT, tables: tables.size, publicHost: publicHost || null }));
+    return;
+  }
+  // 版本标识：好友/你一眼确认「这是游戏服务」而不是某个 IDE 或跳转页
+  if (urlPath === "/__whoami") {
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+    res.end(JSON.stringify({ game: "坦克大战深度版", kind: "game-server", distBuilt: fs.existsSync(path.join(DIST_DIR, "index.html")), host: req.headers.host || null }));
+    return;
+  }
   if (urlPath === "/") urlPath = "/index.html";
   const filePath = path.normalize(path.join(DIST_DIR, urlPath));
   if (!filePath.startsWith(DIST_DIR)) { sendHtml(res, 403, "forbidden"); return; }
