@@ -16,7 +16,10 @@ $:
         - name: build-dist
           script: npm run build
         - name: start-tank-server
-          script:
-            - nohup node server/index.mjs > /tmp/tank-server.log 2>&1 &
-            - sleep 2
-            - cat /tmp/tank-server.log
+          # 注意：script 为字符串时会被包成单行 `sh -c` 执行，
+          # 多行内容的分行/&& 连接会破坏后台运行语义（`& &&` 会报 Syntax error），
+          # 因此这里用 YAML 块标量把所有命令放在同一个 sh 进程内逐行执行。
+          script: |
+            nohup node server/index.mjs > /tmp/tank-server.log 2>&1 &
+            sleep 2
+            cat /tmp/tank-server.log
