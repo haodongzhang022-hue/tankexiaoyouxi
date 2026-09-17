@@ -2,8 +2,8 @@
 node_modules/
 dist/
 
-# test artifacts (huge: ProvenanceData *.ort ~170MB each)
-tests/
+# test artifacts (huge: ProvenanceData *.ort ~170MB each; 根级 tests 即 profile-*/ProvenanceData)
+/tests/
 
 # tunneling binaries & configs (may contain tokens) - never commit
 tools/
