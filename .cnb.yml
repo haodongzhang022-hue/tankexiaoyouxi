@@ -1,22 +1,26 @@
-# 腾讯 CNB 云原生开发流水线 —— ⚠ 仅用于「开发时自测」，不是游戏服务器
+# 腾讯 CNB 云原生开发流水线 —— 云原生开发当「临时服务器 + 临时公网入口」
 #
-# 【定位纠正 · 上一版踩过的坑】
-#   云原生开发的端口预览（https://<环境ID>-3001.cnb.run）不能当长期游戏入口：
-#     1) <环境ID> 每次环境重建都变 → 分享出去的链接立刻失效；
-#     2) 离线约 10 分钟环境被平台回收 → 链接直接打不开；
-#     3) cnb.run 是通配域名，环境不存在时一律 302 跳回 cnb.cool
-#        → 这就是"点开是写代码的网站、不是游戏、没法玩"的直接原因。
+# 【先回答"云原生能不能做网络测试"】能。云原生开发的端口预览就是平台分配的公网入口
+#   （页面 + WebSocket 同源，一个地址即可联机），所以**可以用它先把延迟测出来**，
+#   不必先买腾讯云 ECS。本流水线：npm ci + build + 起服务器（0.0.0.0:3001）+ 自检 + 落盘预览地址。
 #
-# 【本文件的用途】改完代码，起个环境随手看一眼页面/WS 正不正常。
-#   分支页点「云原生开发」→ 自动 npm ci + build + 起服务器（0.0.0.0:3001）+ HTTP 自检；
-#   自测入口：本机 curl http://127.0.0.1:3001/healthz，或 WebIDE 的 PORTS 面板映射 3001。
+# 【不能干什么】不能当长期游戏入口：
+#     · <环境ID> 每次环境重建都会变 → 分享出去的链接很快失效；
+#     · 环境被回收后链接直接打不开（关页 10 分钟无操作 / 最长 18h / 凌晨 4-6 点强制）；
+#     · 域名是通配的，环境不存在时一律 302 跳回 cnb.cool
+#       —— 上次"点进去是写代码的网站、不是游戏"就是这个原因（环境已经被回收了）。
+#   → 长期固定入口见 deploy/README.md（Docker / 腾讯云轻量，http://<IP>:3001 重启不变）。
 #
-# 【长期可玩的公网入口】请看 deploy/README.md —— 常驻 Docker / 腾讯云轻量，
-#   入口固定如 http://<服务器IP>:3001，重启不变、7x24 在线、延迟只取决于物理链路。
+# 【怎么测延迟（3 步）】
+#   1. 分支页点「云原生开发」→ 自动装依赖 + 构建 + 起服务器 + 自检，并把预览地址写到
+#      /tmp/tank-public-url.txt；
+#   2. IDE 终端跑 `npm run net:tunnel -- --test`（自动探测地址是不是游戏服务 + 实测延迟）；
+#      拿不到就 `cat /tmp/tank-public-url.txt`，或用 WebIDE 的 PORTS 面板映射 3001；
+#   3. 把地址发给好友一起测（若跳 cnb.cool = 环境已回收，重新起一次环境即可）。
 #
 # 注意：
 #   - 服务必须监听 0.0.0.0（server/index.mjs 默认如此），只听 127.0.0.1 预览代理回源不到；
-#   - 本文件必须在**目标分支自身**存在，否则该分支的「云原生开发」起不来（见 PR #2 说明）；
+#   - 本文件必须在**目标分支自身**存在，否则该分支的「云原生开发」起不来；
 #   - 这里的 stages 只装依赖/构建/起服务，不要占用 3001，避免与服务器抢端口。
 $:
   vscode:
@@ -46,8 +50,17 @@ $:
               code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3001/ || true)
               echo "本机 3001 自检 HTTP=$code"
               [ "$code" = "200" ] || { echo "服务器未就绪"; exit 1; }
-            # 打印公网地址（注意：必须给 {{port}} 替换值，直接输出模板串会得到带 {{port}} 的无效地址）
-            - node scripts/net-tunnel.mjs
+            # 打预览地址：服务器启动时已落盘 /tmp/tank-public-url.txt（{{port}} 已替换）。
+            # 注意：本 stage 常常读不到平台变量（CI 容器属正常），所以只读文件、不猜地址。
+            - |
+              if [ -f /tmp/tank-public-url.txt ]; then
+                echo "公网预览地址(临时·仅自测): $(cat /tmp/tank-public-url.txt)"
+                echo "测延迟: npm run net:tunnel -- --test"
+              else
+                echo "未拿到端口预览地址（本 stage 无平台变量属正常）"
+                echo "请在云原生开发环境的 IDE 终端执行: npm run net:tunnel"
+                echo "或直接在 WebIDE 的 PORTS 面板映射 3001"
+              fi
 
 # ── Issue/PR 里 @NPC 触发：起服务 + 自检 + 延迟报告，可复现 ──
 # 触发：在本仓库 Issue/PR 评论里 @CodeBuddy（npc 事件），本流水线自动跑一遍。
@@ -77,11 +90,9 @@ issue.comment@npc:
             [ "$code" = "200" ] || { echo "服务器未就绪"; exit 1; }
       - name: tunnel-latency-report
         script:
-          - node scripts/net-tunnel.mjs
-          - |
-            if [ -n "$CNB_VSCODE_PROXY_URI" ]; then
-              node scripts/net-latency.mjs "${CNB_VSCODE_PROXY_URI//\{\{port\}\}/3001}" http://127.0.0.1:3001 || true
-            else
-              echo "无 CNB_VSCODE_PROXY_URI：仅本机基线（见下）"
-              node scripts/net-latency.mjs http://127.0.0.1:3001 || true
-            fi
+          # 确认服务身份（一眼看出是游戏而不是 IDE / 跳转页）
+          - curl -s http://127.0.0.1:3001/__whoami || true
+          - curl -s http://127.0.0.1:3001/healthz || true
+          # 拿预览地址并探测 + 实测（net:tunnel 会读 /tmp/tank-public-url.txt，也会读平台变量）
+          - node scripts/net-tunnel.mjs || true
+          - node scripts/net-tunnel.mjs --test || true
