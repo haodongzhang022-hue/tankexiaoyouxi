@@ -12,8 +12,8 @@
 #   → 长期固定入口见 deploy/README.md（Docker / 腾讯云轻量，http://<IP>:3001 重启不变）。
 #
 # 【怎么测延迟（3 步）】
-#   1. 分支页点「云原生开发」→ 自动装依赖 + 构建 + 起服务器 + 自检，并把预览地址写到
-#      /tmp/tank-public-url.txt；
+#   1. 分支页点「云原生开发」→ 自动装依赖 + 构建 + 起服务器 + 自检 + 实测延迟，
+#      并把预览地址写到 /tmp/tank-public-url.txt（阶段日志里直接可见自检与延迟数字）；
 #   2. IDE 终端跑 `npm run net:tunnel -- --test`（自动探测地址是不是游戏服务 + 实测延迟）；
 #      拿不到就 `cat /tmp/tank-public-url.txt`，或用 WebIDE 的 PORTS 面板映射 3001；
 #   3. 把地址发给好友一起测（若跳 cnb.cool = 环境已回收，重新起一次环境即可）。
@@ -21,7 +21,15 @@
 # 注意：
 #   - 服务必须监听 0.0.0.0（server/index.mjs 默认如此），只听 127.0.0.1 预览代理回源不到；
 #   - 本文件必须在**目标分支自身**存在，否则该分支的「云原生开发」起不来；
-#   - 这里的 stages 只装依赖/构建/起服务，不要占用 3001，避免与服务器抢端口。
+#   - 这里的 stages 只装依赖/构建/起服务/自测，不要占用 3001，避免与服务器抢端口。
+#
+# ⚠ 阶段脚本写法（关键，勿改回 YAML 数组）：
+#   平台对 `script` 为**数组**时，会把数组项用 ` && ` 拼成**单行** `sh -c` 执行；
+#   若某项以 `&` 结尾（后台起服务），拼出来就是 `... 2>&1 & && sleep 2 ...`
+#   → `sh: Syntax error: "&&" unexpected`，**整条命令一条都不执行**（连 pkill 都不跑），
+#   表现为 stage 秒失败（143ms / code 2）、服务从未启动。
+#   因此这里所有阶段脚本统一用**块标量 `script: |`**（项间不再有 && 拼接），
+#   且后台启动一律包进子 shell `( ... & )`，任何拼接语义下都不会出现尾随 `&`。
 $:
   vscode:
     - runner:
@@ -40,30 +48,37 @@ $:
         - name: build-dist
           script: npm run build
         - name: start-tank-server
-          script:
-            - pkill -f "node server/index.mjs" || true
-            - nohup node server/index.mjs > /tmp/tank-server.log 2>&1 &
-            - sleep 2
-            - cat /tmp/tank-server.log
-            # 自检：本机 3001 必须 HTTP 200，否则算失败，避免"环境起来了但服务没起"
-            - |
-              code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3001/ || true)
-              echo "本机 3001 自检 HTTP=$code"
-              [ "$code" = "200" ] || { echo "服务器未就绪"; exit 1; }
-            # 打预览地址：服务器启动时已落盘 /tmp/tank-public-url.txt（{{port}} 已替换）。
-            # 注意：本 stage 常常读不到平台变量（CI 容器属正常），所以只读文件、不猜地址。
-            - |
-              if [ -f /tmp/tank-public-url.txt ]; then
-                echo "公网预览地址(临时·仅自测): $(cat /tmp/tank-public-url.txt)"
-                echo "测延迟: npm run net:tunnel -- --test"
-              else
-                echo "未拿到端口预览地址（本 stage 无平台变量属正常）"
-                echo "请在云原生开发环境的 IDE 终端执行: npm run net:tunnel"
-                echo "或直接在 WebIDE 的 PORTS 面板映射 3001"
-              fi
+          # 单条块标量：所有命令在同一份脚本里逐行执行，项间无 `&&` 拼接；
+          # 后台启动用子 shell 包裹（行尾不出现裸 `&`），平台任何拼接语义下都合法。
+          script: |
+            pkill -f "node server/index.mjs" || true
+            (nohup node server/index.mjs > /tmp/tank-server.log 2>&1 &)
+            sleep 2
+            cat /tmp/tank-server.log
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3001/ || true)
+            echo "本机 3001 自检 HTTP=$code"
+            if [ "$code" = "200" ]; then
+              echo "本机 3001 就绪 OK"
+            else
+              echo "服务器未就绪（stage 失败，避免「环境起来了但服务没起」）"
+              cat /tmp/tank-server.log
+              exit 1
+            fi
+            if [ -f /tmp/tank-public-url.txt ]; then
+              echo "公网预览地址(临时·仅自测): $(cat /tmp/tank-public-url.txt)"
+            else
+              echo "未拿到端口预览地址（本 stage 无平台变量属正常）"
+              echo "请在云原生开发环境的 IDE 终端执行: npm run net:tunnel"
+              echo "或直接在 WebIDE 的 PORTS 面板映射 3001"
+            fi
+            # 验收证据：实测延迟（有公网入口就出公网数字，没有就出本机基线）。
+            # 自测步骤，失败不阻断（|| true）+ 超时兜底，绝不把「云原生开发」打挂。
+            echo "── 延迟实测（公网入口 + 本机回环基线）──"
+            timeout 180 npm run net:tunnel -- --test || true
 
 # ── Issue/PR 里 @NPC 触发：起服务 + 自检 + 延迟报告，可复现 ──
 # 触发：在本仓库 Issue/PR 评论里 @CodeBuddy（npc 事件），本流水线自动跑一遍。
+# 脚本写法同上：块标量 + 子 shell 后台启动，避免 `& &&` 拼接语法错误。
 issue.comment@npc:
   - runner:
       cpus: 4
@@ -78,20 +93,31 @@ issue.comment@npc:
       - name: build-dist
         script: npm run build
       - name: start-server-and-selfcheck
-        script:
-          - pkill -f "node server/index.mjs" || true
-          - nohup node server/index.mjs > /tmp/tank-server.log 2>&1 &
-          - sleep 2
-          - cat /tmp/tank-server.log
-          - |
-            code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3001/ || true)
-            ws=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:3001/?room=1" || true)
-            echo "本机 3001 自检: / => $code, /?room=1 => $ws"
-            [ "$code" = "200" ] || { echo "服务器未就绪"; exit 1; }
+        script: |
+          pkill -f "node server/index.mjs" || true
+          (nohup node server/index.mjs > /tmp/tank-server.log 2>&1 &)
+          sleep 2
+          cat /tmp/tank-server.log
+          code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3001/ || true)
+          ws=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:3001/?room=1" || true)
+          echo "本机 3001 自检: / => $code, /?room=1 => $ws"
+          if [ "$code" = "200" ]; then
+            echo "本机 3001 就绪 OK"
+          else
+            echo "服务器未就绪"
+            exit 1
+          fi
       - name: tunnel-latency-report
-        script:
-          # 确认服务身份（一眼看出是游戏而不是 IDE / 跳转页）
-          - curl -s http://127.0.0.1:3001/__whoami || true
-          - curl -s http://127.0.0.1:3001/healthz || true
-          # 拿预览地址 + 探测服务身份 + 实测延迟（--test 已包含探测，无需再跑一遍 plain）
-          - node scripts/net-tunnel.mjs --test || true
+        script: |
+          # 兜底：万一服务在阶段间被回收，先确保它在（只读自测，不占端口）
+          if ! curl -sf -o /dev/null http://127.0.0.1:3001/healthz; then
+            (nohup node server/index.mjs > /tmp/tank-server.log 2>&1 &)
+            sleep 2
+          fi
+          echo "── 服务身份 ──"
+          curl -s http://127.0.0.1:3001/__whoami || true
+          echo
+          curl -s http://127.0.0.1:3001/healthz || true
+          echo
+          echo "── 预览地址 + 实测延迟（--test 已含身份探测）──"
+          node scripts/net-tunnel.mjs --test || true
