@@ -14,11 +14,12 @@
 //    npm run net:tunnel            打印预览地址 + 探测是不是游戏服务
 //    npm run net:tunnel -- --test  顺带实测该地址的延迟（公网真实数字）
 //    PORT=3000 npm run net:tunnel  指定端口（默认 3001）
-import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+// 预览地址变量表/落盘读写的「单一事实源」（与 server/index.mjs 共用同一份，避免漂移）
+import { PREVIEW_TPL_KEYS, PUBLIC_URL_FILE, buildPreviewUrl, readPublicUrl, portOfUrl } from "../shared/preview-url.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const LATENCY = path.join(__dirname, "net-latency.mjs");
@@ -27,15 +28,9 @@ const PORT = String(process.env.PORT || 3001);
 const argv = process.argv.slice(2);
 const wantTest = argv.includes("--test");
 
-/** 平台注入的端口预览模板：https://<env>-{{port}}.cnb.run（不同版本变量名可能略有差异，全部兜一遍） */
-const tplKeys = [
-  "CNB_VSCODE_PROXY_URI",
-  "CNB_VSCODE_PROXY_URI_HTTPS",
-  "CNB_PROXY_URI",
-  "CNB_PORT_PREVIEW_URI",
-];
+// 平台注入的端口预览模板（变量名表来自 shared/preview-url.mjs 单一事实源）
 const found = [];
-for (const k of tplKeys) {
+for (const k of PREVIEW_TPL_KEYS) {
   const v = process.env[k];
   if (v) found.push({ key: k, uri: v });
 }
@@ -45,19 +40,7 @@ for (const list of Object.values(os.networkInterfaces())) {
   for (const ni of list || []) if (ni.family === "IPv4" && !ni.internal) lan.push(ni.address);
 }
 
-const buildUrl = (tpl) =>
-  tpl.includes("{{port}}")
-    ? tpl.replace(/\{\{\s*port\s*\}\}/g, PORT).replace(/\/+$/, "")
-    : tpl.replace(/\/+$/, "");
-
-/** 服务器启动时会把预览地址写到这个文件；终端直接读它最稳（不依赖同 shell 的环境变量）。 */
-const PUBLIC_URL_FILE = process.env.PUBLIC_URL_FILE || "/tmp/tank-public-url.txt";
-function urlFromFile() {
-  try {
-    const v = fs.readFileSync(PUBLIC_URL_FILE, "utf8").trim();
-    return v || "";
-  } catch { return ""; }
-}
+const buildUrl = (tpl) => buildPreviewUrl(tpl, PORT);
 
 /** 探测目标是不是我们的游戏服务（关键：识别平台「环境不存在」的 302 跳转，别把跳转当游戏）。 */
 async function probe(url) {
@@ -83,18 +66,28 @@ async function probe(url) {
   return out;
 }
 
-const wsUrl = (u) => u.replace(/^http/i, "ws");
 const line = (s = "") => console.log(s);
 
 line();
 line("================ 坦克大战 · 联机公网入口 ================");
 
-let publicUrl = found.length ? buildUrl(found[0].uri) : urlFromFile();
+// 落盘地址要校验端口/时效：文件可能来自上一次运行（端口不同）或环境早已回收
+const fromFile = readPublicUrl({ port: PORT });
+let publicUrl = found.length ? buildUrl(found[0].uri) : fromFile.url;
+const urlPort = publicUrl ? portOfUrl(publicUrl) : "";
+// 读文件得来的地址若校验不过（端口不符 / 过期 / 无元数据）→ 明确告警，别拿旧地址当真
+if (!found.length && fromFile.url && !fromFile.ok) {
+  line(`  ⚠ 落盘地址未通过校验：${fromFile.note}`);
+  line(`     仍尝试探测，但若失败请先重新起服务器（npm run online）刷新 ${PUBLIC_URL_FILE}`);
+}
+if (!publicUrl && fromFile.note) line(`  ⚠ 忽略落盘地址：${fromFile.note}`);
 if (publicUrl) {
   line(`  端口预览地址(临时·仅自测): ${publicUrl}`);
   if (found.length) line(`  变量来源:                   ${found.map((f) => f.key).join(", ")}`);
-  else line(`  来源:                       ${PUBLIC_URL_FILE}（服务器启动时写入）`);
-  line(`  端口:                       ${PORT}（服务器需监听 0.0.0.0:${PORT}）`);
+  else line(`  来源:                       ${PUBLIC_URL_FILE}（服务器启动时写入，${fromFile.note}）`);
+  // 打印地址真实端口，避免"文件里是 9999 却显示 3001"的误导（端口编进主机名时说明走默认 443）
+  line(`  地址端口:                   ${urlPort || (/^https:/i.test(publicUrl) ? "443（https 默认，端口编在主机名里）" : "80（http 默认）")}${urlPort && urlPort !== PORT ? `  ⚠ 与当前 PORT ${PORT} 不一致（服务器落盘的是别的端口）` : ""}`);
+  line(`  服务器监听端口:             ${PORT}（须 0.0.0.0:${PORT}，否则预览代理回源不到）`);
   line();
   line("  ⚠ 这是**临时**入口，不要当长期游戏入口发给好友：");
   line("      · <环境ID> 每次环境重建都变 → 旧链接立即失效；");
@@ -107,7 +100,8 @@ if (publicUrl) {
   line("  ▸ 好友一起测：把上面的地址发给好友（可先自己浏览器打开确认能看到《坦克大战深度版》）");
   line("  ▸ 长期可玩：部署常驻服务器，见 deploy/README.md（入口固定 http://<IP>:3001）");
 } else {
-  line("  ✗ 未检测到端口预览地址（既无 CNB_VSCODE_PROXY_URI，也读不到 " + PUBLIC_URL_FILE + "）");
+  line("  ✗ 未检测到可用的端口预览地址（平台变量未注入，且 " + PUBLIC_URL_FILE + " 不存在/已失效）");
+  if (fromFile.note) line("    落盘文件的情况：" + fromFile.note);
   line("    → 当前多半不在云原生开发环境（CI 容器不会分配公网域名）；");
   line("    → 在云原生开发环境里：WebIDE 的 **PORTS 面板** 映射 " + PORT + "，面板给出的地址即为预览地址；");
   line("      或先起服务器（npm run build && npm run online），它启动时会把预览地址写入 " + PUBLIC_URL_FILE + "。");

@@ -7,7 +7,8 @@ export default defineConfig({
   },
   test: {
     environment: "node",
-    include: ["tests/**/*.test.ts", "net-sync-core/tests/**/*.test.ts"],
+    // src/**/*.test.ts：与源码同目录的单元测试（tests/ 被 .gitignore 忽略，仅本机用）
+    include: ["tests/**/*.test.ts", "net-sync-core/tests/**/*.test.ts", "src/**/*.test.ts"],
     coverage: {
       provider: "v8",
       include: ["src/**/*.ts"],

@@ -21,8 +21,7 @@ npm run net:tunnel -- --test   # 探测"是不是游戏服务" + 实测延迟
 ## 方案 A · 本地/局域网机器 + Docker（最快得到固定入口）
 
 ```bash
-npm run build
-docker build -f deploy/Dockerfile -t tank-online .
+docker build -f deploy/Dockerfile -t tank-online .   # 前端在镜像里构建，宿主无需 npm run build
 docker run -d --name tank -p 3001:3001 --restart=always tank-online
 ```
 
@@ -39,7 +38,7 @@ docker run -d --name tank -p 3001:3001 --restart=always tank-online
 # 安全组放行 TCP 3001
 scp -r . root@<服务器IP>:/opt/tank     # 或 git clone
 ssh root@<服务器IP>
-cd /opt/tank && npm run build
+cd /opt/tank
 docker build -f deploy/Dockerfile -t tank-online .
 docker run -d --name tank -p 3001:3001 --restart=always tank-online
 ```
@@ -92,15 +91,38 @@ server {
 
 ## P2P 直连（进一步压低延迟）
 
-默认两端都走服务器中继。给**两端**都配 STUN 可提升 P2P 直连概率，
-让快照少走一跳中转：
+默认两端都走服务器中继。P2P 直连由构建期变量 `VITE_ICE_SERVERS` 控制
+（`src/net/RtcPeer.ts` 读取，逗号分隔多个地址）：
+
+- **不配置**（默认）：`iceServers: []` → 只有同机/局域网能直连，公网跨 NAT 必然失败并自动回落 WS 中继，游戏不受影响；
+- **配置 STUN**：公网跨 NAT 也有机会直连，快照少走一跳中转；
+- 自建 coturn 最稳（对称 NAT 下也能打洞）。
 
 ```bash
 VITE_ICE_SERVERS="stun:stun.qq.com" npm run build
+# 多个：VITE_ICE_SERVERS="stun:stun.qq.com,stun:你的coturn:3478"
 ```
 
-自建 coturn 最稳（也能在对称 NAT 下打洞成功）：
+⚠ 这是**构建期**变量（Vite 打包时静态替换），改完必须重新 `npm run build`，
+仅改运行环境变量无效。docker 构建时同理：
 
 ```bash
-VITE_ICE_SERVERS="stun:你的coturn:3478" npm run build
+docker build -f deploy/Dockerfile --build-arg VITE_ICE_SERVERS="stun:stun.qq.com" -t tank-online .
 ```
+
+## 换端口 / 健康检查
+
+镜像里端口全部跟着 `PORT` 走（含 `HEALTHCHECK`），换端口只需：
+
+```bash
+docker run -d --name tank -p 8080:8080 -e PORT=8080 --restart=always tank-online
+```
+
+健康检查打的是 `/healthz`（只证明进程活着，不依赖 dist 是否构建）：
+
+```bash
+docker inspect --format '{{.State.Health.Status}}' tank   # healthy
+curl -s http://127.0.0.1:3001/healthz                     # {"ok":true,...}
+```
+
+一键脚本 `bash deploy/start-server.sh [端口]` 会把上面几步连起来跑（含健康检查等待）。

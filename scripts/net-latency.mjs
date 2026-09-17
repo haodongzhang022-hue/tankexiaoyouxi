@@ -16,8 +16,6 @@
 //
 //  环境变量：SAMPLES=20（ping 样本数，默认 20）
 import { WebSocket } from "ws";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 const targets = process.argv.slice(2).filter((a) => a && !a.startsWith("--"));
 if (!targets.length) {
@@ -26,7 +24,6 @@ if (!targets.length) {
   process.exit(1);
 }
 const SAMPLES = Number(process.env.SAMPLES || 20);
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const pct = (arr, p) => arr[Math.min(arr.length - 1, Math.floor(arr.length * p))];
 const stat = (arr) => {

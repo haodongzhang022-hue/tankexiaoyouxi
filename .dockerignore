@@ -1,0 +1,18 @@
+# 构建上下文瘦身：这些都不需要进镜像（node_modules 由镜像内 npm ci 生成）
+node_modules
+dist
+.git
+.gitignore
+.cnb.yml
+tools
+*.log
+*.log.*
+*.zip
+*.msi
+*.exe
+.tmp-*
+.probe
+.trae
+.vscode
+docs
+tests

@@ -93,6 +93,5 @@ issue.comment@npc:
           # 确认服务身份（一眼看出是游戏而不是 IDE / 跳转页）
           - curl -s http://127.0.0.1:3001/__whoami || true
           - curl -s http://127.0.0.1:3001/healthz || true
-          # 拿预览地址并探测 + 实测（net:tunnel 会读 /tmp/tank-public-url.txt，也会读平台变量）
-          - node scripts/net-tunnel.mjs || true
+          # 拿预览地址 + 探测服务身份 + 实测延迟（--test 已包含探测，无需再跑一遍 plain）
           - node scripts/net-tunnel.mjs --test || true

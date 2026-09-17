@@ -18,6 +18,8 @@ import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket } from "ws";
+// 预览地址变量表/落盘读写的「单一事实源」（与 scripts/net-tunnel.mjs 共用同一份，避免漂移）
+import { detectPreviewUrl, writePublicUrl, PUBLIC_URL_FILE } from "../shared/preview-url.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DIST_DIR = path.resolve(__dirname, "..", "dist");
@@ -74,12 +76,9 @@ const httpServer = http.createServer((req, res) => {
   // 与 "/" 的区别：这里只证明**服务进程活着**，不关心 dist 是否构建，返回极小的 JSON。
   if (urlPath === "/healthz") {
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
-    res.end(JSON.stringify({
-      ok: true, service: "tank-online", port: PORT, tables: tables.size,
-      publicHost: publicHost || null,
-      previewUrl: detectPreviewUrl(PORT) || null,
-      previewUrlFile: PUBLIC_URL_FILE,
-    }));
+    // 只暴露存活必需信息：ok/service/port/tables。
+    // 预览地址与落盘文件绝对路径属本地/自测信息，公网常驻服务器上不必要 → 不外泄。
+    res.end(JSON.stringify({ ok: true, service: "tank-online", port: PORT, tables: tables.size }));
     return;
   }
   // 版本标识：好友/你一眼确认「这是游戏服务」而不是某个 IDE 或跳转页
@@ -148,38 +147,9 @@ const SERVER_INFO = { lanIps: LAN_IPS, port: PORT };
 // 把 {{port}} 换成实际端口即得到该端口的公网预览地址（页面与 WS 同源）。
 // 注意：这是**临时**入口（环境ID 随环境重建而变、环境回收即失效），只用于自测延迟，
 //       不能当长期游戏入口 —— 长期入口见 deploy/README.md（常驻服务器）。
-const PREVIEW_TPL_KEYS = [
-  "CNB_VSCODE_PROXY_URI",
-  "CNB_VSCODE_PROXY_URI_HTTPS",
-  "CNB_PROXY_URI",
-  "CNB_PORT_PREVIEW_URI",
-  "CNB_PREVIEW_URI",
-];
-const PUBLIC_URL_FILE = process.env.PUBLIC_URL_FILE || "/tmp/tank-public-url.txt";
-
-/** 返回替换端口后的预览地址；读不到平台变量时返回 ""（不瞎猜）。 */
-function detectPreviewUrl(port) {
-  for (const k of PREVIEW_TPL_KEYS) {
-    const tpl = process.env[k];
-    if (!tpl) continue;
-    const url = tpl.replace(/\{\{\s*port\s*\}\}/g, String(port)).replace(/\/+$/, "");
-    if (!url || url.includes("{{")) continue;
-    return url;
-  }
-  return "";
-}
-
-/** 把预览地址落盘，方便 IDE 终端一条 cat 就拿到（终端里跑 node 也能读到同一份）。 */
+/** 服务器启动时把预览地址落盘（写 .txt + .json），方便 IDE 终端一条 cat 就拿到。 */
 function persistPublicUrl(port) {
-  const url = detectPreviewUrl(port);
-  if (!url) return "";
-  try {
-    fs.writeFileSync(PUBLIC_URL_FILE, url + "\n", "utf8");
-    fs.writeFileSync(PUBLIC_URL_FILE + ".json", JSON.stringify({ url, port, pid: process.pid, at: new Date().toISOString() }, null, 2), "utf8");
-  } catch (e) {
-    console.warn("[public-url] 写入失败（不影响服务）: " + (e && e.message));
-  }
-  return url;
+  return writePublicUrl(port);
 }
 
 let publicHost = "";
