@@ -1,0 +1,22 @@
+# 腾讯 CNB 云原生开发流水线（坦克大战联机测试）
+# 用途：点分支页「云原生开发」→ 用 node:20 容器自动装依赖、构建 dist、后台起 WS 服务（端口 3001）
+# 进入 WebIDE 后在 PORTS 面板映射 3001 取 cnb.run 预览 URL（标准模式；onlyPreview 不支持代理转发）
+$:
+  vscode:
+    - docker:
+        image: node:20
+      services:
+        - vscode
+        - docker
+      env:
+        PORT: "3001"
+      stages:
+        - name: install-deps
+          script: npm ci
+        - name: build-dist
+          script: npm run build
+        - name: start-tank-server
+          script:
+            - nohup node server/index.mjs > /tmp/tank-server.log 2>&1 &
+            - sleep 2
+            - cat /tmp/tank-server.log
