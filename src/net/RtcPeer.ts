@@ -2,12 +2,30 @@
 //  目的：同网段/局域网对战时，快照走 P2P 低延迟通道，拉掉"中继一跳"。
 //  原则与约束：
 //    - 信令仍走现有 WS 中继（服务器仅转发 rtc_signal 给目标 clientId，不感知内容）；
-//    - 不做 STUN/TURN（公网跨 NAT 不保证连通）→ 连通失败自动保持 WS 兜底，游戏不受影响；
+//    - ICE 服务器由构建期环境变量 VITE_ICE_SERVERS 提供（逗号分隔，如 "stun:stun.qq.com"）；
+//      不配置时 = 纯直连（仅同机/局域网可用）→ 连通失败自动保持 WS 兜底，游戏不受影响；
 //    - 快照"双发"：WS 兜底 + P2P（P2P 帧先到即先渲染，成员端按帧号天然去重）。
 export type RtcRole = "host" | "member";
 export type RtcState = "idle" | "negotiating" | "connected" | "failed" | "closed";
 
 const ICE_TIMEOUT_MS = 900; // host 候选收集超时限（同机/局域网足够）
+
+/**
+ * 解析构建期注入的 ICE 服务器列表：VITE_ICE_SERVERS="stun:stun.qq.com,stun:1.2.3.4:3478"
+ * 未配置 → 返回 []（纯直连：仅同机/局域网，公网跨 NAT 会失败并自动回落 WS）。
+ * 注意：这是**构建期**变量（Vite 在打包时替换），改了要重新 npm run build。
+ */
+export function parseIceServers(raw?: string | null): RTCIceServer[] {
+  if (!raw) return [];
+  return String(raw)
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((url) => ({ urls: url }));
+}
+
+/** 当前构建实际使用的 ICE 服务器（供 HUD/日志/自检显示，避免"文档说了但没生效"） */
+export const ICE_SERVERS: RTCIceServer[] = parseIceServers(import.meta.env?.VITE_ICE_SERVERS as string | undefined);
 
 export class RtcPeer {
   state: RtcState = "idle";
@@ -31,7 +49,8 @@ export class RtcPeer {
     if (this.state !== "idle") return this.state;
     this.state = "negotiating";
     try {
-      this.pc = new RTCPeerConnection({ iceServers: [] }); // 纯直连：局域网/同机；公网靠 STUN 未配置 → 失败即回落
+      // 未配 VITE_ICE_SERVERS 时为 []（纯直连，仅同机/局域网）；配了 STUN 则公网跨 NAT 也有机会直连
+      this.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
       this.pc.onicecandidate = (e) => {
         if (e.candidate) this.sendSignal(this.peerId, { kind: "ice", candidate: e.candidate.toJSON() });
       };

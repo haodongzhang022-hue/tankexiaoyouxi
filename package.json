@@ -14,7 +14,8 @@
     "dual": "node scripts/quick-dual-test.mjs",
     "host-ai": "node scripts/ai-host.mjs",
     "net:tunnel": "node scripts/net-tunnel.mjs",
-    "net:latency": "node scripts/net-latency.mjs"
+    "net:latency": "node scripts/net-latency.mjs",
+    "deploy:server": "bash deploy/start-server.sh"
   },
   "dependencies": {
     "ws": "^8.21.0"

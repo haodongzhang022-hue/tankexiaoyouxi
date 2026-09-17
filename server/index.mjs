@@ -18,6 +18,8 @@ import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket } from "ws";
+// 预览地址变量表/落盘读写的「单一事实源」（与 scripts/net-tunnel.mjs 共用同一份，避免漂移）
+import { detectPreviewUrl, writePublicUrl, PUBLIC_URL_FILE } from "../shared/preview-url.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DIST_DIR = path.resolve(__dirname, "..", "dist");
@@ -70,6 +72,21 @@ const httpServer = http.createServer((req, res) => {
   let urlPath;
   try { urlPath = decodeURIComponent(new URL(req.url, "http://x").pathname); }
   catch { sendHtml(res, 400, "bad request"); return; }
+  // 健康检查（供 Docker HEALTHCHECK / 云负载均衡 / 你自己 curl 用）
+  // 与 "/" 的区别：这里只证明**服务进程活着**，不关心 dist 是否构建，返回极小的 JSON。
+  if (urlPath === "/healthz") {
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+    // 只暴露存活必需信息：ok/service/port/tables。
+    // 预览地址与落盘文件绝对路径属本地/自测信息，公网常驻服务器上不必要 → 不外泄。
+    res.end(JSON.stringify({ ok: true, service: "tank-online", port: PORT, tables: tables.size }));
+    return;
+  }
+  // 版本标识：好友/你一眼确认「这是游戏服务」而不是某个 IDE 或跳转页
+  if (urlPath === "/__whoami") {
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+    res.end(JSON.stringify({ game: "坦克大战深度版", kind: "game-server", distBuilt: fs.existsSync(path.join(DIST_DIR, "index.html")), host: req.headers.host || null }));
+    return;
+  }
   if (urlPath === "/") urlPath = "/index.html";
   const filePath = path.normalize(path.join(DIST_DIR, urlPath));
   if (!filePath.startsWith(DIST_DIR)) { sendHtml(res, 403, "forbidden"); return; }
@@ -125,6 +142,16 @@ const SERVER_INFO = { lanIps: LAN_IPS, port: PORT };
 // 隧道(cpolar/cloudflared 等)转发请求时会带原始 Host 头（如 600ecc6f.r3.cpolar.cn）。
 // 服务器从任何进站 HTTP/WS 请求自动学习"当前公网域名"，随 welcome/tables 广播给所有
 // 客户端 → 游戏内邀请链接实时自动适配，隧道域名怎么变都不用手动改。
+// ── 端口预览地址探测（云原生开发自测用）──────────────────────────
+// 平台把端口预览模板注入到开发环境，形如 https://<环境ID>-{{port}}.<业务域名>。
+// 把 {{port}} 换成实际端口即得到该端口的公网预览地址（页面与 WS 同源）。
+// 注意：这是**临时**入口（环境ID 随环境重建而变、环境回收即失效），只用于自测延迟，
+//       不能当长期游戏入口 —— 长期入口见 deploy/README.md（常驻服务器）。
+/** 服务器启动时把预览地址落盘（写 .txt + .json），方便 IDE 终端一条 cat 就拿到。 */
+function persistPublicUrl(port) {
+  return writePublicUrl(port);
+}
+
 let publicHost = "";
 function learnPublicHost(hostHeader) {
   if (!hostHeader) return; // Host 必须是公网域名才更新（局域网/localhost 已被下面过滤）
@@ -606,17 +633,21 @@ httpServer.listen(PORT, HOST, () => {
       if (ni.family === "IPv4" && !ni.internal) lanIps.push(ni.address);
     }
   }
+  persistPublicUrl(PORT);
   console.log(`[坦克大战联机] 服务器已启动（页面 + WebSocket 同端口）`);
   console.log(`  本机游玩:   http://localhost:${PORT}`);
   for (const ip of lanIps) console.log(`  局域网分享: http://${ip}:${PORT}`);
   console.log(`  监听地址:   ${HOST}:${PORT}`);
   // 云原生开发（CNB）会注入端口预览模板 https://<环境ID>-{{port}}.cnb.run，
   // 直接把 {{port}} 替换成端口就是公网分享地址（页面与 WS 同源，一个链接即可联机）。
-  const proxyTpl = process.env.CNB_VSCODE_PROXY_URI || process.env.CNB_VSCODE_PROXY_URI_HTTPS || process.env.CNB_PROXY_URI || process.env.CNB_PORT_PREVIEW_URI;
-  if (proxyTpl) {
-    const pub = proxyTpl.replace(/\{\{port\}\}/g, String(PORT)).replace(/\/$/, '');
-    console.log(`  公网分享:   ${pub}   ← 直接发给好友，打开即进大厅`);
+  const pub = detectPreviewUrl(PORT);
+  if (pub) {
+    console.log(`  公网预览:   ${pub}   ← 云原生开发临时入口（环境回收即失效，仅供自测）`);
     console.log(`  延迟自测:   npm run net:latency -- ${pub}`);
+    console.log(`  地址已写入: ${PUBLIC_URL_FILE}   （IDE 终端里 cat 一下即可复制）`);
+  } else {
+    console.log(`  公网预览:   未检测到（当前不在云原生开发环境 / 未注入 CNB_VSCODE_PROXY_URI）`);
+    console.log(`  自测入口:   WebIDE 的 PORTS 面板映射 ${PORT}，面板给出的地址即为预览地址`);
   }
   console.log(`  外网分享:   用路由器端口转发 / ngrok / frp / Cloudflare Tunnel 暴露 ${PORT} 端口后，把公网地址发给好友`);
   console.log(`  提示: 若提示没有游戏页面，请先在项目目录执行 npm run build`);

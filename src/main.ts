@@ -10,7 +10,7 @@ import { StageMode } from "./modes/StageMode";
 import { DpsTestMode } from "./modes/DpsTestMode";
 import { OnlineHostMode } from "./modes/OnlineHostMode";
 import { NetClient } from "./net/NetClient";
-import { RtcPeer } from "./net/RtcPeer";
+import { RtcPeer, ICE_SERVERS } from "./net/RtcPeer";
 import type { ServerCandidate } from "./net/NetClient";
 // ── net-sync-core 通用资产：成员端解码/延迟/重连全部由模块驱动 ──
 import { SyncCodec, LatencyTracker, ReconnectManager } from "../net-sync-core/core";
@@ -157,6 +157,9 @@ let lastCheckpoint: CheckpointPlayer[] | null = null;
 function tryStartP2P(start: { myIndex: number; players: Array<{ clientId: number; name: string }> }): RtcPeer | null {
   try {
     if (start.players.length < 2) return null;
+    // 自检句柄：确认当前构建到底带没带 STUN（VITE_ICE_SERVERS 是构建期变量，配了才有）
+    (window as any).__iceServers = ICE_SERVERS;
+    if (ICE_SERVERS.length) console.log("[p2p] ICE 服务器: " + ICE_SERVERS.map((s) => s.urls).join(", "));
     const other = start.players.find((p) => p.clientId !== net.myClientId);
     if (!other) return null;
     const p = new RtcPeer((to, payload) => net.rtcSignal(to, payload), other.clientId, start.myIndex === 0 ? "host" : "member");
