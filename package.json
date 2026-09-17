@@ -1,0 +1,26 @@
+{
+  "name": "web-tank-battle",
+  "version": "0.1.0",
+  "description": "Noita风格弹药组装  FC坦克大战  肉鸽Roguelike 网页游戏",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "online": "node server/index.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:debug": "vitest run --inspect-brk --no-file-parallelism",
+    "dual": "node scripts/quick-dual-test.mjs",
+    "host-ai": "node scripts/ai-host.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^5.3.0",
+    "vite": "^5.0.0",
+    "vitest": "^3.0.0"
+  }
+}

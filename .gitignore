@@ -1,0 +1,30 @@
+# build / deps
+node_modules/
+dist/
+
+# test artifacts (huge: ProvenanceData *.ort ~170MB each)
+tests/
+
+# tunneling binaries & configs (may contain tokens) - never commit
+tools/
+*.exe
+*.zip
+*.msi
+*.lnk
+
+# logs / temp
+*.log
+*.log.*
+*.txt
+.tmp-*
+cf.*
+cpolar*
+
+# editor / probe
+.probe/
+.trae/
+.vscode/
+
+# os
+Thumbs.db
+desktop.ini
