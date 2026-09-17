@@ -23,13 +23,21 @@
 #   - 本文件必须在**目标分支自身**存在，否则该分支的「云原生开发」起不来；
 #   - 这里的 stages 只装依赖/构建/起服务/自测，不要占用 3001，避免与服务器抢端口。
 #
-# ⚠ 阶段脚本写法（关键，勿改回 YAML 数组）：
-#   平台对 `script` 为**数组**时，会把数组项用 ` && ` 拼成**单行** `sh -c` 执行；
-#   若某项以 `&` 结尾（后台起服务），拼出来就是 `... 2>&1 & && sleep 2 ...`
-#   → `sh: Syntax error: "&&" unexpected`，**整条命令一条都不执行**（连 pkill 都不跑），
-#   表现为 stage 秒失败（143ms / code 2）、服务从未启动。
-#   因此这里所有阶段脚本统一用**块标量 `script: |`**（项间不再有 && 拼接），
-#   且后台启动一律包进子 shell `( ... & )`，任何拼接语义下都不会出现尾随 `&`。
+# ⚠⚠ 阶段脚本两个「真机踩过」的坑（改本文件前必读，勿回退）：
+#
+#   坑 1｜`script` 写成 YAML 数组 + 后台启动项以 `&` 结尾 → 整条命令一条都不执行
+#     平台对数组型 script 会把各项用 ` && ` 拼成**单行** `sh -c` 执行；`... 2>&1 &` 后接 `&&`
+#     得到 `... 2>&1 & && sleep 2 ...` → `sh: Syntax error: "&&" unexpected`，
+#     连前面的 pkill 都不跑，stage 秒失败（143ms / code 2）。
+#     → 本文件所有阶段脚本统一用**块标量 `script: |`**（项间无 `&&` 拼接），
+#       且后台启动一律包进子 shell `( ... & )`，任何拼接语义下都不会出现尾随裸 `&`。
+#
+#   坑 2｜`pkill -f "<脚本里出现过的字符串>"` 会**杀掉自己**
+#     平台把整段脚本作为 `sh -c "<脚本文本>"` 执行，该 shell 的**命令行里就含脚本文本**；
+#     `pkill -f "node server/index.mjs"` 因此匹配到自身 → 自己给自己 SIGTERM →
+#     stage 以 `code 143`（signal SIGTERM）秒失败，且**看不到任何后续输出**。
+#     → 本文件**不再用 `pkill -f`**：改用「先探 /healthz 复用、否则按 PID 文件收旧进程」，
+#       既不误杀自己，也不会重复起进程。
 $:
   vscode:
     - runner:
@@ -48,20 +56,32 @@ $:
         - name: build-dist
           script: npm run build
         - name: start-tank-server
-          # 单条块标量：所有命令在同一份脚本里逐行执行，项间无 `&&` 拼接；
-          # 后台启动用子 shell 包裹（行尾不出现裸 `&`），平台任何拼接语义下都合法。
+          # 块标量单条脚本：无 `&&` 拼接、后台启动在子 shell 里、不 pkill 自匹配。
           script: |
-            pkill -f "node server/index.mjs" || true
-            (nohup node server/index.mjs > /tmp/tank-server.log 2>&1 &)
-            sleep 2
-            cat /tmp/tank-server.log
+            set -u
+            if curl -sf -o /dev/null --max-time 3 http://127.0.0.1:3001/healthz; then
+              echo "[start] 3001 已有健康服务，复用现有进程"
+            else
+              if [ -f /tmp/tank-server.pid ]; then
+                old=$(cat /tmp/tank-server.pid 2>/dev/null || true)
+                if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+                  kill "$old" 2>/dev/null || true
+                  sleep 1
+                fi
+              fi
+              echo "[start] 启动服务器（0.0.0.0:3001）"
+              (nohup node server/index.mjs > /tmp/tank-server.log 2>&1 & echo $! > /tmp/tank-server.pid)
+              sleep 2
+            fi
+            echo "── 服务器启动日志 ──"
+            cat /tmp/tank-server.log 2>/dev/null || true
             code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3001/ || true)
             echo "本机 3001 自检 HTTP=$code"
             if [ "$code" = "200" ]; then
               echo "本机 3001 就绪 OK"
             else
               echo "服务器未就绪（stage 失败，避免「环境起来了但服务没起」）"
-              cat /tmp/tank-server.log
+              cat /tmp/tank-server.log 2>/dev/null || true
               exit 1
             fi
             if [ -f /tmp/tank-public-url.txt ]; then
@@ -78,7 +98,7 @@ $:
 
 # ── Issue/PR 里 @NPC 触发：起服务 + 自检 + 延迟报告，可复现 ──
 # 触发：在本仓库 Issue/PR 评论里 @CodeBuddy（npc 事件），本流水线自动跑一遍。
-# 脚本写法同上：块标量 + 子 shell 后台启动，避免 `& &&` 拼接语法错误。
+# 脚本写法同上（块标量 + 子 shell 后台启动 + 不用 pkill -f），规避上面两个坑。
 issue.comment@npc:
   - runner:
       cpus: 4
@@ -94,10 +114,23 @@ issue.comment@npc:
         script: npm run build
       - name: start-server-and-selfcheck
         script: |
-          pkill -f "node server/index.mjs" || true
-          (nohup node server/index.mjs > /tmp/tank-server.log 2>&1 &)
-          sleep 2
-          cat /tmp/tank-server.log
+          set -u
+          if curl -sf -o /dev/null --max-time 3 http://127.0.0.1:3001/healthz; then
+            echo "[start] 3001 已有健康服务，复用现有进程"
+          else
+            if [ -f /tmp/tank-server.pid ]; then
+              old=$(cat /tmp/tank-server.pid 2>/dev/null || true)
+              if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+                kill "$old" 2>/dev/null || true
+                sleep 1
+              fi
+            fi
+            echo "[start] 启动服务器（0.0.0.0:3001）"
+            (nohup node server/index.mjs > /tmp/tank-server.log 2>&1 & echo $! > /tmp/tank-server.pid)
+            sleep 2
+          fi
+          echo "── 服务器启动日志 ──"
+          cat /tmp/tank-server.log 2>/dev/null || true
           code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3001/ || true)
           ws=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:3001/?room=1" || true)
           echo "本机 3001 自检: / => $code, /?room=1 => $ws"
@@ -109,9 +142,10 @@ issue.comment@npc:
           fi
       - name: tunnel-latency-report
         script: |
-          # 兜底：万一服务在阶段间被回收，先确保它在（只读自测，不占端口）
-          if ! curl -sf -o /dev/null http://127.0.0.1:3001/healthz; then
-            (nohup node server/index.mjs > /tmp/tank-server.log 2>&1 &)
+          set -u
+          # 兜底：万一服务在阶段间被回收，先确保它在（复用同一套安全启动写法）
+          if ! curl -sf -o /dev/null --max-time 3 http://127.0.0.1:3001/healthz; then
+            (nohup node server/index.mjs > /tmp/tank-server.log 2>&1 & echo $! > /tmp/tank-server.pid)
             sleep 2
           fi
           echo "── 服务身份 ──"
@@ -120,4 +154,4 @@ issue.comment@npc:
           curl -s http://127.0.0.1:3001/healthz || true
           echo
           echo "── 预览地址 + 实测延迟（--test 已含身份探测）──"
-          node scripts/net-tunnel.mjs --test || true
+          timeout 180 node scripts/net-tunnel.mjs --test || true
