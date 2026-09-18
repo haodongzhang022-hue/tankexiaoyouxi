@@ -31,6 +31,13 @@
 #     连前面的 pkill 都不跑，stage 秒失败（143ms / code 2）。
 #     → 本文件所有阶段脚本统一用**块标量 `script: |`**（项间无 `&&` 拼接），
 #       且后台启动一律包进子 shell `( ... & )`，任何拼接语义下都不会出现尾随裸 `&`。
+#     ⚠ 反例（曾写进 Issue #3 的「修正示例」里，**照抄必挂，已实测失败**）：
+#         script: |
+#           nohup node server/index.mjs > /tmp/tank-server.log 2>&1 &
+#           sleep 2
+#       块标量下每行都是独立命令，`&` 只把 nohup 放后台并**立即**执行下一行；
+#       父 shell 退出时子进程收到 SIGHUP/SIGTERM → `code 143`，且日志里后续输出全丢。
+#       必须写成子 shell：`( nohup ... > log 2>&1 & echo $! > pid )`。
 #
 #   坑 2｜`pkill -f "<脚本里出现过的字符串>"` 会**杀掉自己**
 #     平台把整段脚本作为 `sh -c "<脚本文本>"` 执行，该 shell 的**命令行里就含脚本文本**；
@@ -96,62 +103,67 @@ $:
             echo "── 延迟实测（公网入口 + 本机回环基线）──"
             timeout 180 npm run net:tunnel -- --test || true
 
-# ── Issue/PR 里 @NPC 触发：起服务 + 自检 + 延迟报告，可复现 ──
-# 触发：在本仓库 Issue/PR 评论里 @CodeBuddy（npc 事件），本流水线自动跑一遍。
-# 脚本写法同上（块标量 + 子 shell 后台启动 + 不用 pkill -f），规避上面两个坑。
-issue.comment@npc:
-  - runner:
-      cpus: 4
-    docker:
-      image: node:20
-    env:
-      PORT: "3001"
-      HOST: "0.0.0.0"
-    stages:
-      - name: install-deps
-        script: npm ci
-      - name: build-dist
-        script: npm run build
-      - name: start-server-and-selfcheck
-        script: |
-          set -u
-          if curl -sf -o /dev/null --max-time 3 http://127.0.0.1:3001/healthz; then
-            echo "[start] 3001 已有健康服务，复用现有进程"
-          else
-            if [ -f /tmp/tank-server.pid ]; then
-              old=$(cat /tmp/tank-server.pid 2>/dev/null || true)
-              if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
-                kill "$old" 2>/dev/null || true
-                sleep 1
+  # ── Issue/PR 里 @NPC 触发：起服务 + 自检 + 延迟报告，可复现 ──
+  # 触发：在本仓库 Issue/PR 评论里 @CodeBuddy（npc 事件），本流水线自动跑一遍。
+  # 脚本写法同上（块标量 + 子 shell 后台启动 + 不用 pkill -f），规避上面两个坑。
+  #
+  # ⚠ 结构要求（仓库级事件必须挂进 `$` 兜底分支）：平台配置层级是
+  #   分支 → 事件 → Pipeline 数组。`issue.*` / `tag_push` 等**仓库级事件**
+  #   必须写在 `$` 分支**下面**（与已存在的 vscode 平级），不能另起一个 `$:`，
+  #   否则 YAML 重复键 / Schema 校验不通过。
+  issue.comment@npc:
+    - runner:
+        cpus: 4
+      docker:
+        image: node:20
+      env:
+        PORT: "3001"
+        HOST: "0.0.0.0"
+      stages:
+        - name: install-deps
+          script: npm ci
+        - name: build-dist
+          script: npm run build
+        - name: start-server-and-selfcheck
+          script: |
+            set -u
+            if curl -sf -o /dev/null --max-time 3 http://127.0.0.1:3001/healthz; then
+              echo "[start] 3001 已有健康服务，复用现有进程"
+            else
+              if [ -f /tmp/tank-server.pid ]; then
+                old=$(cat /tmp/tank-server.pid 2>/dev/null || true)
+                if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+                  kill "$old" 2>/dev/null || true
+                  sleep 1
+                fi
               fi
+              echo "[start] 启动服务器（0.0.0.0:3001）"
+              (nohup node server/index.mjs > /tmp/tank-server.log 2>&1 & echo $! > /tmp/tank-server.pid)
+              sleep 2
             fi
-            echo "[start] 启动服务器（0.0.0.0:3001）"
-            (nohup node server/index.mjs > /tmp/tank-server.log 2>&1 & echo $! > /tmp/tank-server.pid)
-            sleep 2
-          fi
-          echo "── 服务器启动日志 ──"
-          cat /tmp/tank-server.log 2>/dev/null || true
-          code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3001/ || true)
-          ws=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:3001/?room=1" || true)
-          echo "本机 3001 自检: / => $code, /?room=1 => $ws"
-          if [ "$code" = "200" ]; then
-            echo "本机 3001 就绪 OK"
-          else
-            echo "服务器未就绪"
-            exit 1
-          fi
-      - name: tunnel-latency-report
-        script: |
-          set -u
-          # 兜底：万一服务在阶段间被回收，先确保它在（复用同一套安全启动写法）
-          if ! curl -sf -o /dev/null --max-time 3 http://127.0.0.1:3001/healthz; then
-            (nohup node server/index.mjs > /tmp/tank-server.log 2>&1 & echo $! > /tmp/tank-server.pid)
-            sleep 2
-          fi
-          echo "── 服务身份 ──"
-          curl -s http://127.0.0.1:3001/__whoami || true
-          echo
-          curl -s http://127.0.0.1:3001/healthz || true
-          echo
-          echo "── 预览地址 + 实测延迟（--test 已含身份探测）──"
-          timeout 180 node scripts/net-tunnel.mjs --test || true
+            echo "── 服务器启动日志 ──"
+            cat /tmp/tank-server.log 2>/dev/null || true
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3001/ || true)
+            ws=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:3001/?room=1" || true)
+            echo "本机 3001 自检: / => $code, /?room=1 => $ws"
+            if [ "$code" = "200" ]; then
+              echo "本机 3001 就绪 OK"
+            else
+              echo "服务器未就绪"
+              exit 1
+            fi
+        - name: tunnel-latency-report
+          script: |
+            set -u
+            # 兜底：万一服务在阶段间被回收，先确保它在（复用同一套安全启动写法）
+            if ! curl -sf -o /dev/null --max-time 3 http://127.0.0.1:3001/healthz; then
+              (nohup node server/index.mjs > /tmp/tank-server.log 2>&1 & echo $! > /tmp/tank-server.pid)
+              sleep 2
+            fi
+            echo "── 服务身份 ──"
+            curl -s http://127.0.0.1:3001/__whoami || true
+            echo
+            curl -s http://127.0.0.1:3001/healthz || true
+            echo
+            echo "── 预览地址 + 实测延迟（--test 已含身份探测）──"
+            timeout 180 node scripts/net-tunnel.mjs --test || true
