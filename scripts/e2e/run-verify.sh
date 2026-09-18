@@ -37,7 +37,9 @@ build_ref ef80055     "$ROOT/.probe/prefixbuild"
 # ── 服务 ──
 start_server() { # $1=dir $2=port
   curl -sf -o /dev/null --max-time 2 "http://127.0.0.1:$2/healthz" && return
-  (cd "$1" && PORT="$2" HOST=127.0.0.1 nohup node server/index.mjs > "/tmp/srv-$2.log" 2>&1 & echo $! > "/tmp/srv-$2.pid")
+  # HOST=0.0.0.0（与部署一致）：服务器自登记的入口 IP 必须真的可达，否则前端「入口自救」
+  # 会额外弹提示并把邀请错误文案盖掉（旧脚本绑 127.0.0.1 时的假失败，非产品问题）
+  (cd "$1" && PORT="$2" HOST=0.0.0.0 nohup node server/index.mjs > "/tmp/srv-$2.log" 2>&1 & echo $! > "/tmp/srv-$2.pid")
   for _ in $(seq 1 60); do curl -sf -o /dev/null --max-time 2 "http://127.0.0.1:$2/healthz" && break; sleep 0.25; done
 }
 (cd "$ROOT" && npm run build >/dev/null 2>&1) || true

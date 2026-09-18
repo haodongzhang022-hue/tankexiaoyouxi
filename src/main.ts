@@ -857,6 +857,18 @@ function startGame(mode: number): void {
 // ── 联机流程 ──
 function notifyOnline(msg: string): void { onlineMsg = msg; onlineMsgTimer = 2.5; }
 
+/**
+ * 与 notifyOnline 相同，但**不盖掉**还没过期的更具体提示。
+ * v2.39 合并集成：main 的「入口自救」（ensureLocalPlayableEntry，welcome 后 1.4s）会给一句
+ * 「连不上登记的入口，已就地开玩」——这是**本机视角的自愈说明**；若它盖掉 1.4s 内刚出的
+ * 邀请链接失败原因（已满 / 已不存在 / 本局进行中），玩家就看不到「为什么没进去」。
+ * 故仅在消息位空闲时才提示（有更具体提示在显示 → 让位）。
+ */
+function notifyOnlineIfQuiet(msg: string): void {
+  if (onlineMsgTimer > 0) return;
+  notifyOnline(msg);
+}
+
 function enterOnline(): void {
   cancelOnlineReconnect();    // v2.25 手动进入：清掉待执行的重连
   tablesSynced = false;
@@ -1002,7 +1014,7 @@ async function ensureLocalPlayableEntry(): Promise<void> {
     } catch { reachable = false; }
     if (reachable) return;                                       // 入口可达：保持现状，不必自救
     console.log(`[稳定入口] 登记的入口 ${target} 从本机连不上 → 就地使用当前地址 ${origin}`);
-    notifyOnline("当前网络连不上服务器登记的入口，已就地用你打开的这个地址开玩");
+    notifyOnlineIfQuiet("当前网络连不上服务器登记的入口，已就地用你打开的这个地址开玩");
   }
   // ① 本地稳定入口 = 当前实际可用的地址（玩家刷新/断线重连走它）
   entryMgr.save({ sid, roomId: onlineCurrent?.id ?? autoJoinRoom ?? entryMgr.peek()?.roomId ?? null, url: origin });

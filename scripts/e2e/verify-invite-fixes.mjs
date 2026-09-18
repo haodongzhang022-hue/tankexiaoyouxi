@@ -379,6 +379,54 @@ try {
     }
     await host.ctx.close();
   }
+  // ═════════ 🔴（合并面）稳定链接形态：<入口>/<sid>/join/<roomId> —— main 成果不得回退 ═════════
+  //  评审打回点：PR 分支曾整体缺席 main 的稳定入口（entryMgr/stableEntryPath/… 出现次数为 0），
+  //  若按「取 PR 侧」解冲突，会把 Issue #11 的稳定链接 + v3.0.2 的 IP 形态分享一起回退。
+  for (const [vw, vh, label] of [[1200, 800, "横屏 968×640"], [480, 920, "竖屏 480×920"]]) {
+    const { ctx, page } = await open(3001, vw, vh, "?room=1&debug=1");
+    await waitFor(page, `d.state().inTable === true`);
+    await sleep(600);
+    const url = String(j(await dbg(page, `d.inviteUrl()`)));
+    const m = /^(https?:\/\/[^/]+)\/([0-9a-f]{8})\/join\/(\d+)$/.exec(url);
+    ok(`🔴(合并面) [${label}] 邀请链接 = <入口>/<sid>/join/<roomId>（main 稳定入口未回退）`,
+      !!m && !url.includes("?room=") && !url.includes("localhost") && !url.includes("127.0.0.1"),
+      `inviteUrl=${url}`);
+    // 服务器侧真跳一次：稳定链接必须 302 到「当前入口」且把房号带过去（不靠自述，直接打 HTTP）
+    if (m) {
+      const r = await fetch(`http://127.0.0.1:3001/${m[2]}/join/1`, { redirect: "manual" });
+      const loc = r.headers.get("location") || "";
+      ok(`🔴(合并面) [${label}] 稳定链接 302 → 当前入口 + 房号保留`,
+        r.status === 302 && loc.includes("room=1"), `status=${r.status} location=${loc}`);
+    }
+    const lobby = String(j(await dbg(page, `d.lobbyUrl()`)));
+    ok(`🔴(合并面) [${label}] 大厅链接 = <入口>/<sid>/join/（不带房号 → 好友进大厅）`,
+      /\/[0-9a-f]{8}\/join\/$/.test(lobby) && !lobby.includes("room="), `lobbyUrl=${lobby}`);
+    await ctx.close();
+  }
+
+  // ═════════ 🔴（合并面）与 main 对跑：写入公网入口记忆后，两边链接形态必须同口径 ═════════
+  //  评审实测差异：main(3002) → <入口>/<sid>/join/1；旧 PR(3001) → https://203.0.113.9/?room=1
+  //  （sid 丢失 + IP 被打成 https）。此处锁「不再回退」：两边同为稳定入口形态。
+  {
+    const shapeOf = async (port) => {
+      const { ctx, page } = await open(port, 1200, 800, "?room=1&debug=1");
+      await page.evaluate(() => { try { localStorage.setItem("tank_public_host", "203.0.113.9:3001"); } catch {} });
+      await page.reload({ waitUntil: "networkidle2" });
+      await sleep(3000);
+      const url = String(j(await dbg(page, `d.inviteUrl()`)));
+      await ctx.close();
+      return url;
+    };
+    const u1 = await shapeOf(3001);
+    const u2 = await shapeOf(3002);
+    // 抹掉端口与 sid（两边是不同进程，sid/端口必然不同）→ 只比「链接形态」
+    const norm = (u) => u.replace(/:\d+\//, "/").replace(/\/[0-9a-f]{8}\/join\//, "/<sid>/join/");
+    ok("🔴(合并面) 写入公网入口记忆后：PR 侧与 main 侧链接形态一致（稳定入口形态 + 未直拼 IP/未打成 https）",
+      /\/[0-9a-f]{8}\/join\/1$/.test(u1) && /\/[0-9a-f]{8}\/join\/1$/.test(u2) &&
+      !u1.includes("203.0.113.9") && norm(u1) === norm(u2),
+      `PR(3001)=${u1} ｜ main(3002)=${u2} ｜ 归一化后 PR=${norm(u1)} / main=${norm(u2)}`);
+  }
+
 } finally {
   await browser.close();
 }
