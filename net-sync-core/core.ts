@@ -442,6 +442,63 @@ export interface KVStorage { getItem(k: string): string | null; setItem(k: strin
 /** 重连卡：断线/刷新后凭 {tableId, token} 回到原座位（对齐 v2.11 局内重进） */
 export interface RejoinCard { tableId: number; token: string }
 
+/**
+ * 稳定入口卡：把「玩家手里的固定分享链接」记下来。
+ * 地址随环境/隧道变化时，凭它 + 服务器内部 id 自动匹配到当前实际地址（对齐 v3 稳定入口机制）。
+ *  - sid：服务器内部 id（8 位十六进制）。同一进程内恒定；环境重建/重启后换新 → 需要重新分享。
+ *  - roomId：进房房间号（邀请链接里带）；无则打开后进大厅。
+ */
+export interface StableEntryCard { sid: string; roomId?: number | null; url?: string }
+
+export const STABLE_ENTRY_SID_RE = /^[0-9a-f]{8}$/;
+
+/** 稳定入口路径（与 shared/entry-match.mjs 的 entryPath 同构） */
+export function entryPathOf(sid: string, roomId?: number | null): string {
+  const s = String(sid || "").toLowerCase();
+  if (!STABLE_ENTRY_SID_RE.test(s)) return "";
+  return roomId == null ? `/${s}/join/` : `/${s}/join/${roomId}`;
+}
+
+/** 从任意链接里解析稳定入口卡（兼容 /<sid>/join/<room> 与 /entry/<sid> 两种写法） */
+export function parseStableEntry(url: string): StableEntryCard | null {
+  try {
+    const u = new URL(String(url), "http://placeholder.local");
+    const m = /^\/([0-9a-fA-F]{8})\/join\/?(\d*)\/?$/.exec(u.pathname) || /^\/entry\/([0-9a-fA-F]{8})\/?$/.exec(u.pathname);
+    if (!m) return null;
+    const sid = m[1].toLowerCase();
+    const room = m[2] ? Number(m[2]) : Number(u.searchParams.get("room") || 0);
+    return { sid, roomId: Number.isFinite(room) && room > 0 ? room : null, url: String(url) };
+  } catch { return null; }
+}
+
+/** 稳定入口管理器：卡存取 + 是否还匹配当前服务器（sid 变了 = 环境换了，需重新分享） */
+export class StableEntryManager {
+  constructor(private storage: KVStorage, private key: string) {}
+  save(card: StableEntryCard): void { this.storage.setItem(this.key, JSON.stringify(card)); }
+  peek(): StableEntryCard | null {
+    try {
+      const v = this.storage.getItem(this.key);
+      const c = v ? (JSON.parse(v) as StableEntryCard) : null;
+      return c && STABLE_ENTRY_SID_RE.test(String(c.sid || "")) ? c : null;
+    } catch { return null; }
+  }
+  clear(): void { this.storage.removeItem(this.key); }
+  /** 服务器汇报的 sid 与手里稳定的 sid 是否一致（不一致说明环境已重建，链接需重新分享） */
+  matches(sid: string): boolean {
+    const c = this.peek();
+    return !!c && String(c.sid) === String(sid || "").toLowerCase();
+  }
+  /** 服务器每次心跳/欢迎都会汇报最新 sid → 自动滚动更新卡片（同一进程内 sid 不变，无需重分享） */
+  adopt(sid: string, url?: string, roomId?: number | null): StableEntryCard | null {
+    const s = String(sid || "").toLowerCase();
+    if (!STABLE_ENTRY_SID_RE.test(s)) return null;
+    const prev = this.peek();
+    const card: StableEntryCard = { sid: s, roomId: roomId ?? prev?.roomId ?? null, url: url || prev?.url };
+    this.save(card);
+    return card;
+  }
+}
+
 /** 重连管理：卡片存取 + 状态机（idle → reconnecting → joined / failed） */
 export class ReconnectManager {
   state: "idle" | "reconnecting" | "joined" | "failed" = "idle";

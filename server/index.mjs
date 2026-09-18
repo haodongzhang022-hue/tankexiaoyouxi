@@ -20,6 +20,8 @@ import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket } from "ws";
 // 预览地址变量表/落盘读写的「单一事实源」（与 scripts/net-tunnel.mjs 共用同一份，避免漂移）
 import { detectPreviewUrl, writePublicUrl, PUBLIC_URL_FILE } from "../shared/preview-url.mjs";
+// 「稳定入口 ↔ 当前临时地址」自动匹配表（与共享层同一份实现，见 shared/entry-match.mjs）
+import { createEntryMatcher, entryPath, makeSid, SID_RE, ENTRY_TTL_MS, ENTRY_KEEPALIVE_MS, ENTRY_SWEEP_MS, currentOrigin, normalizeOrigin } from "../shared/entry-match.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DIST_DIR = path.resolve(__dirname, "..", "dist");
@@ -28,6 +30,20 @@ const PORT = parseInt(process.env.PORT || "3001", 10);
 // 监听地址：默认 0.0.0.0（容器/端口预览代理回源需要），可用 HOST=127.0.0.1 收紧到本机
 const HOST = process.env.HOST || "0.0.0.0";
 const MAX_SEATS = 4;
+// 服务可见性（联机自检报告用）：服务器启动时刻 + 进程内持续在服务的证明
+const STARTED_AT = Date.now();
+let lastClientSeenAt = 0;      // 最近一次收到任意客户端消息的时刻
+let lastEntryRefreshAt = 0;    // 最近一次刷新「当前入口」的时刻
+
+// ── 稳定入口自动匹配 ────────────────────────────────────────────────
+// 服务器内部 id（sid）恒定到进程重启：分享出去的链接 /<sid>/join/<roomId> 因此是"稳定"的；
+// 平台环境重建/隧道换域名/换 IP 时，sid 会换新，但客户端心跳会把「新规格的地址」自动登记回匹配表，
+// 老链接打开时由 /:sid/join/:room 自动 302 到最新可用地址 —— 这就是"自动匹配到稳定之上"。
+// 可用 TANK_SID 固定（自测/复现方便），否则每次启动新生成 —— 稳定链接的"稳定"来自自动匹配，不来自硬编码
+const SID = SID_RE.test(String(process.env.TANK_SID || "").trim().toLowerCase())
+  ? String(process.env.TANK_SID).trim().toLowerCase()
+  : makeSid();
+const entries = createEntryMatcher(SID);
 
 // ── 静态文件服务（dist/）─────────────────────────────────────────
 const MIME = {
@@ -75,10 +91,24 @@ const httpServer = http.createServer((req, res) => {
   // 健康检查（供 Docker HEALTHCHECK / 云负载均衡 / 你自己 curl 用）
   // 与 "/" 的区别：这里只证明**服务进程活着**，不关心 dist 是否构建，返回极小的 JSON。
   if (urlPath === "/healthz") {
+    // 入口自动匹配的自证信息：服务是否真的在、内部 id、当前入口、匹配到的临时地址数量。
+    // healthz 也是"这个地址确实在服务"的探针（部署脚本/保活脚本/好友都会打它），
+    // 但它不改写**已确立**的当前入口：只有还没有可分享入口时才据此建立（避免本机 curl 顶掉公网域名）。
+    noteIncomingOrigin(originOfRequest(req), "healthz");
+    if (!CURRENT_ORIGIN) refreshCurrentOrigin(req, "healthz");
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
-    // 只暴露存活必需信息：ok/service/port/tables。
-    // 预览地址与落盘文件绝对路径属本地/自测信息，公网常驻服务器上不必要 → 不外泄。
-    res.end(JSON.stringify({ ok: true, service: "tank-online", port: PORT, tables: tables.size }));
+    res.end(JSON.stringify({
+      ok: true,
+      service: "tank-online",
+      port: PORT,
+      tables: tables.size,
+      sid: SID,
+      uptimeS: Math.round((Date.now() - STARTED_AT) / 1000),
+      lastClientSeenS: lastClientSeenAt ? Math.round((Date.now() - lastClientSeenAt) / 1000) : null,
+      clients: wss.clients.size,
+      current: CURRENT_ORIGIN || null,
+      matched: entries.size(),          // 自动匹配表里的稳定入口条数
+    }));
     return;
   }
   // 版本标识：好友/你一眼确认「这是游戏服务」而不是某个 IDE 或跳转页
@@ -87,6 +117,51 @@ const httpServer = http.createServer((req, res) => {
     res.end(JSON.stringify({ game: "坦克大战深度版", kind: "game-server", distBuilt: fs.existsSync(path.join(DIST_DIR, "index.html")), host: req.headers.host || null }));
     return;
   }
+  // ── 稳定入口自动匹配：/<sid>/join/<roomId> ──────────────────────
+  // 玩家手里是这条固定链接；实际域名/IP 变了也无所谓 —— 这里 302 到**当前**可用地址。
+  const mJoin = /^\/([0-9a-f]{8})\/join\/(\d*)$/.exec(urlPath);
+  if (mJoin) {
+    const sid = mJoin[1];
+    const roomId = mJoin[2] ? Number(mJoin[2]) : null;
+    noteIncomingOrigin(originOfRequest(req), "join");   // 老域名/新域名都记一笔，但不轻易顶掉当前入口
+    if (sid === SID) {
+      const here = originOfRequest(req);
+      // 服务刚起/很久没人连 → 用匹配表里最新的地址（老链接自动找到最新地址）；
+      // 否则用请求进来的域名（说明这个域名此刻确实在服务，同源跳转最稳）。
+      const usable = [latestEntryOrigin(), previousPublicOrigin(), detectPreviewUrl(PORT)].filter(Boolean).filter(isShareableOrigin);
+      // 规则：**当前入口** 优先（它就是"现在真正在用的地址"）；没有当前入口才用请求进来的域名。
+      // 例外：请求进来的域名就是当前入口（或两者仅协议不同）→ 同源跳转，少一跳、最稳。
+      const cur = normalizeOrigin(CURRENT_ORIGIN);
+      const same = cur && (here === cur || here.replace(/^http:/, "https:") === cur);
+      const target = same ? here : (cur && isShareableOrigin(cur) ? cur : (isShareableOrigin(here) ? here : (usable[0] || here)));
+      redirectTo(res, roomId ? `${target}/?room=${roomId}` : `${target}/`);
+      return;
+    }
+    const e = entries.lookup(sid);
+    if (e) {
+      redirectTo(res, roomId ? `${e.current}/?room=${roomId}` : `${e.current}/`);
+      return;
+    }
+    sendEntryGone(res, sid);
+    return;
+  }
+  // 裸稳定入口：/entry/<sid>（不带房间）等价于 /<sid>/join/
+  const mEntry = /^\/entry\/([0-9a-f]{8})$/.exec(urlPath);
+  if (mEntry) {
+    noteIncomingOrigin(originOfRequest(req), "entry");
+    if (mEntry[1] === SID) {
+      const here = originOfRequest(req);
+      const usable = [latestEntryOrigin(), previousPublicOrigin(), detectPreviewUrl(PORT)].filter(Boolean).filter(isShareableOrigin);
+      redirectTo(res, `${isShareableOrigin(here) ? here : (usable[0] || here)}/`);
+    }
+    else {
+      const e = entries.lookup(mEntry[1]);
+      if (e) redirectTo(res, `${e.current}/`);
+      else sendEntryGone(res, mEntry[1]);
+    }
+    return;
+  }
+
   if (urlPath === "/") urlPath = "/index.html";
   const filePath = path.normalize(path.join(DIST_DIR, urlPath));
   if (!filePath.startsWith(DIST_DIR)) { sendHtml(res, 403, "forbidden"); return; }
@@ -153,15 +228,132 @@ function persistPublicUrl(port) {
 }
 
 let publicHost = "";
+// 当前对外入口（origin，如 https://xxx-3001.cnb.run）：优先平台预览地址，其次请求 Host 拼出来
+let CURRENT_ORIGIN = "";
+function originOfRequest(req) {
+  const host = req && req.headers ? req.headers.host : "";
+  if (!host) return "";
+  const proto = String((req.headers && req.headers["x-forwarded-proto"]) || "").split(",")[0].trim()
+    || (/^https:/i.test(detectPreviewUrl(PORT) || "") ? "https" : "http");
+  return normalizeOrigin(`${proto}://${host}`);
+}
+/**
+ * 刷新「当前入口」并自动登记到匹配表（稳定入口 → 当前地址）。
+ * 两类触发：
+ *   ① 服务器进程内定时（setInterval）→ 环境一直有服务时，绑定不会过期；
+ *   ② 任何进站请求（HTTP/WS/ping）→ 客户端上报自己实际连着的地址，实测可用才登记。
+ */
+function recordEntry(origin, why) {
+  const o = normalizeOrigin(origin);
+  if (!o) return "";
+  const prev = CURRENT_ORIGIN;
+  CURRENT_ORIGIN = o;
+  lastEntryRefreshAt = Date.now();
+  entries.bind(SID, o, null);
+  if (prev !== o && prev) console.log(`[匹配] 当前入口已变化: ${prev} → ${o}（旧链接仍可用，打开会自动跳到新地址）`);
+  if (why === "server" || why === "ws" || why === "migrate") console.log(`[匹配] 稳定入口刷新(${why}): ${o}`);
+  return o;
+}
+
+function refreshCurrentOrigin(req, why) {
+  const here = originOfRequest(req);
+  if (isShareableOrigin(here)) noteIncomingOrigin(here, why);   // 老域名/新域名都记一笔
+  const origin = currentOrigin([
+    detectPreviewUrl(PORT),
+    publicHost ? `https://${publicHost}` : "",
+    CURRENT_ORIGIN,
+  ]);
+  if (origin) recordEntry(origin, why);
+}
+
+/**
+ * 登记「刚被访问到的公网域名」。
+ * 关键取舍：请求进来的域名**能查到 sid** 说明它确实在服务同一台服务器 ——
+ * 可能是环境重建换了新域名（要把稳定链接迁过去），也可能是玩家还拿着已经作废的旧域名（不能迁）。
+ * 分不清就安全地不迁：先用旧域名回跳提示一次；若旧域名随后不可用，玩家浏览器会失败，
+ * 届时我们再依据「最新一条心跳/请求」的地址提供可操作的重新分享提示（绝不给出连不上的地址）。
+ */
+function noteIncomingOrigin(origin, why) {
+  const o = normalizeOrigin(origin);
+  if (!isShareableOrigin(o)) return;                  // 本机/内网访问不参与
+  const cur = normalizeOrigin(CURRENT_ORIGIN);
+  if (o === cur) return;
+  const established = cur && isShareableOrigin(cur);   // 当前入口已经是一个可分享域名
+  if (!established) { recordEntry(o, why); return; }   // 还没有稳定入口 → 建立它（首次进入 / healthz 自证）
+  console.log(`[匹配] 另一个可用域名访问: ${o}（当前入口仍为 ${cur}；无活动客户端时才自动迁移）`);
+}
+
+/** 只有「被证明可用」的入口才迁：客户端心跳（ping）说明这个地址真的有活人连着 → 允许迁移 */
+function confirmOriginFromClient(origin, why) {
+  const o = normalizeOrigin(origin);
+  if (!isShareableOrigin(o)) return;
+  if (o !== CURRENT_ORIGIN) recordEntry(o, why);
+  lastClientSeenAt = Date.now();
+}
+
+/**
+ * 「当前入口」是否够新鲜：
+ *   最近 ENTRY_FRESH_MS 内有客户端心跳或定时刷新 → 直接用同源跳转（更快、也更可能是对的域名）；
+ *   否则（服务器刚起、或很久没有客户端）→ 用匹配表里**最新登记的地址**跳，做到"链接跟着最新地址走"。
+ */
+const ENTRY_FRESH_MS = 80 * 1000;
+/** 是否为「可分享的公网入口」：域名（非 IP）+ 非本机/内网。用于决定稳定链接跳到哪儿。 */
+function isShareableOrigin(origin) {
+  try {
+    const u = new URL(String(origin));
+    const h = u.hostname.toLowerCase();
+    if (!h) return false;
+    if (h === "localhost" || h === "0.0.0.0" || h === "::1") return false;
+    if (/^(\d{1,3}\.){3}\d{1,3}$/.test(h)) return false;                       // 纯 IP（含局域网）不可分享
+    return true;
+  } catch { return false; }
+}
+
+/** 匹配表里**最近**登记到的一个可用地址（含本机内网地址时会被过滤掉，不会是 localhost） */
+function latestEntryOrigin() {
+  let best = "";
+  let bestAge = Infinity;
+  for (const e of entries.list()) {
+    if (e.ageMs < bestAge) { best = e.current; bestAge = e.ageMs; }
+  }
+  return best;
+}
+
+/**
+ * 拿到「玩家可能还持有的旧地址」：服务器动态学习到的上一个公网域名（不含本机地址）。
+ * 用途：本机自测时日志里的 /healthz 会学习到 localhost 地址，此时不能把它当"最新地址"，
+ * 否则会把真正在服务的公网域名顶掉。所以只把域名类的学习结果作为旧地址。
+ */
+function previousPublicOrigin() {
+  return publicHost ? `https://${publicHost}` : "";
+}
+
+function redirectTo(res, location) {
+  res.writeHead(302, { Location: location, "Cache-Control": "no-store", "Content-Type": "text/plain; charset=utf-8" });
+  res.end(`正在自动匹配到当前地址…\n${location}\n`);
+}
+
+/** 稳定入口对应的环境已经换了（服务器内部 id 变了）：给出可操作的提示，而不是干巴巴 404 */
+function sendEntryGone(res, sid) {
+  sendHtml(res, 200, `<!DOCTYPE html><html lang="zh"><meta charset="utf-8">
+<title>坦克大战 · 入口已失效</title><body style="background:#0a0a0a;color:#ddd;font-family:monospace;padding:32px;line-height:1.9">
+<h2 style="color:#ffd700">这条链接暂时匹配不到服务器</h2>
+<p>链接里的服务器内部 id <b>${String(sid).replace(/[^0-9a-f]/gi, "")}</b> 已不再服务（环境被回收或服务器已重启）。</p>
+<p>请让房主重新分享一条链接 —— 新链接会自动匹配到新的临时地址，无需手动改 IP/域名。</p>
+<p style="color:#888">（本机仍在线的话：<a style="color:#4af" href="/">打开当前服务器</a>）</p>
+</body></html>`);
+}
+
 function learnPublicHost(hostHeader) {
-  if (!hostHeader) return; // Host 必须是公网域名才更新（局域网/localhost 已被下面过滤）
+  if (!hostHeader) return ""; // Host 必须是公网域名才更新（局域网/localhost 已被下面过滤）
   let h = String(hostHeader).replace(/^www\./, "").toLowerCase();
   h = h.startsWith("[") ? h.slice(1, h.indexOf("]")) : h.split(":")[0];
-  if (!h || h === "localhost" || h === "127.0.0.1" || h === "0.0.0.0" || h === "::1") return;
-  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(h)) return;                // 纯 IP 不学（要域名）
-  if (/^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h)) return; // 私网不学
+  if (!h || h === "localhost" || h === "127.0.0.1" || h === "0.0.0.0" || h === "::1") return "";
+  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(h)) return "";                // 纯 IP 不学（要域名）
+  if (/^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h)) return ""; // 私网不学
   publicHost = h;
   console.log("[动态适配] 学习到公网入口域名: " + h);
+  return h;
 }
 
 // ── 大厅数据 ──
@@ -251,6 +443,11 @@ function broadcastTable(table) {
     if (s && s.ws && s.ws.readyState === WebSocket.OPEN) s.ws.send(msg);
   }
 }
+/** 取回 WS 连接对应的原始请求（welcome/ping 汇报当前入口时要用 Host 头） */
+function reqOfWs(ws) {
+  return ws && ws.__req ? ws.__req : null;
+}
+
 function sendRaw(ws, obj) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
@@ -261,15 +458,20 @@ function makeHost(table) {
 // ── 连接管理 ──
 wss.on("connection", (ws, req) => {
   learnPublicHost(req && req.headers && req.headers.host);
+  // 有客户端连进来 = 这个地址确实可用 → 按需把「当前入口」迁到它并登记（稳定入口 → 临时地址）
+  confirmOriginFromClient(originOfRequest(req), "ws");
   const conn = { id: nextClient++, name: "玩家", tableId: null, idx: -1 };
   ws.conn = conn;
+  ws.__req = req;                  // ping 汇报入口时要用 Host 头
+  lastClientSeenAt = Date.now();
   // serverInfo：告知客户端本机的真实局域网地址 + 动态学习的公网入口
-  sendRaw(ws, { t: "welcome", clientId: conn.id, serverInfo: SERVER_INFO, publicHost: publicHost || undefined });
+  sendRaw(ws, { t: "welcome", clientId: conn.id, serverInfo: SERVER_INFO, publicHost: publicHost || undefined, sid: SID, url: CURRENT_ORIGIN || undefined, entryPath: entryPath(SID) });
   broadcastTables(null);
 
   ws.on("message", (raw) => {
     let msg;
     try { msg = JSON.parse(String(raw)); } catch { return; }
+    lastClientSeenAt = Date.now();   // 客户端活着（联机自检 /healthz 用它证明"服务真在用"）
     handle(ws, conn, msg);
   });
 
@@ -454,8 +656,12 @@ function handle(ws, conn, msg) {
 
   // 游戏期
   if (t === "ping") {
-    // RTT 探测：原样回包（ts 为客户端发起的原时间戳）
-    sendRaw(ws, { t: "pong", ts: Number(msg.ts) || Date.now() });
+    // RTT 探测：原样回包（ts 为客户端发起的原时间戳）。
+    // 顺带回带「当前入口 + 服务器内部 id」：客户端据此**自动匹配**到最新地址并刷新手里的稳定链接，
+    // 无需知道环境重建后的新域名（这就是"变化的部分自动挂载到稳定之上"）。
+    lastClientSeenAt = Date.now();
+    confirmOriginFromClient(originOfRequest(reqOfWs(ws)), "ping");
+    sendRaw(ws, { t: "pong", ts: Number(msg.ts) || Date.now(), sid: SID, url: CURRENT_ORIGIN || undefined });
     return;
   }
   if (t === "input") {
@@ -613,6 +819,14 @@ function leaveTable(conn, table) {
   broadcastTables(null);
 }
 
+// ── 匹配表维护 + 环境保活 ───────────────────────────────────────
+// ① 定时刷新「当前入口」：环境一直有服务时，稳定入口→临时地址的绑定不会过期（TTL 5 分钟）；
+// ② 定时清理陈旧绑定：隧道/环境换掉后，旧临时地址最多再挂 5 分钟就被摘掉；
+//    固定链接打开时若匹配到的地址已不可用，会**在同一次跳转里自动匹配到最新地址**（见下方跳转 302）。
+// ③ KEEPALIVE 是可选的外层保活（云原生环境离线 10 分钟会被回收）：
+//    设 TANK_KEEPALIVE=1 后，服务器每 60s 对自己公网入口发一次 /healthz，让环境一直有心跳。
+setInterval(() => { refreshCurrentOrigin(null, "server"); entries.sweep(); }, ENTRY_SWEEP_MS).unref?.();
+
 httpServer.on("error", (err) => {
   console.error(`[http] 服务器错误（已捕获）: ${err && err.stack ? err.stack : err}`);
 });
@@ -649,6 +863,26 @@ httpServer.listen(PORT, HOST, () => {
     console.log(`  公网预览:   未检测到（当前不在云原生开发环境 / 未注入 CNB_VSCODE_PROXY_URI）`);
     console.log(`  自测入口:   WebIDE 的 PORTS 面板映射 ${PORT}，面板给出的地址即为预览地址`);
   }
+  // 稳定入口：链接形状不变，域名/IP 变了由 302 自动匹配 —— 玩家永远只需要手里这一条链接
+  refreshCurrentOrigin(null, "server");
+  console.log(`  ── 稳定入口（分享给好友的链接形状，换域名/换 IP 都不用改）──`);
+  console.log(`  服务器内部 id: ${SID}（同一进程内恒定；环境重建/重启后自动换新并自动匹配）`);
+  console.log(`  稳定链接:      <当前入口>${entryPath(SID)}        ← 例如 ${CURRENT_ORIGIN || "http://<你的地址>"}${entryPath(SID)}`);
+  console.log(`  自动匹配:      打开稳定链接 → 302 到"当前实际可用地址"；匹配表 ${entries.size()} 条，${ENTRY_TTL_MS / 60000} 分钟无心跳自动解绑`);
+  console.log(`  自检:          GET ${CURRENT_ORIGIN || ""}/healthz （ok/clients/sid/matched）`);
   console.log(`  外网分享:   用路由器端口转发 / ngrok / frp / Cloudflare Tunnel 暴露 ${PORT} 端口后，把公网地址发给好友`);
   console.log(`  提示: 若提示没有游戏页面，请先在项目目录执行 npm run build`);
 });
+
+// ── 可选：外层保活（云原生开发环境离线约 10 分钟会被回收）────────────────
+// TANK_KEEPALIVE=1 时，每 60s 对自己当前入口发一次 /healthz，保持环境不被判定离线。
+if (process.env.TANK_KEEPALIVE === "1") {
+  setInterval(() => {
+    const base = CURRENT_ORIGIN;
+    if (!base) return;
+    fetch(base + "/healthz").then((r) => r.text()).then((t) => {
+      try { const j = JSON.parse(t); console.log(`[保活] ${ENTRY_KEEPALIVE_MS / 1000}s 心跳 OK（clients=${j.clients}, uptime=${j.uptimeS}s）`); } catch {}
+    }).catch((e) => console.warn("[保活] 心跳失败（环境可能已被回收）: " + e.message));
+  }, ENTRY_KEEPALIVE_MS).unref?.();
+  console.log("[保活] 已开启：每 60s 汇报一次，避免云原生环境被回收");
+}

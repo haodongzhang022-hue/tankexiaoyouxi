@@ -13,7 +13,7 @@ import { NetClient } from "./net/NetClient";
 import { RtcPeer, ICE_SERVERS } from "./net/RtcPeer";
 import type { ServerCandidate } from "./net/NetClient";
 // ── net-sync-core 通用资产：成员端解码/延迟/重连全部由模块驱动 ──
-import { SyncCodec, LatencyTracker, ReconnectManager } from "../net-sync-core/core";
+import { SyncCodec, LatencyTracker, ReconnectManager, StableEntryManager, entryPathOf, parseStableEntry } from "../net-sync-core/core";
 import { TANK_SYNC_SCHEMA, stateToNetSnapshot } from "../net-sync-core/adapters/tank-adapter";
 import type { NetTable, MigratedMsg, CheckpointPlayer } from "./net/NetTypes";
 import { RemoteView } from "./ui/RemoteView";
@@ -148,6 +148,61 @@ const rejoinMgr = new ReconnectManager({
   setItem: (k, v) => { try { localStorage.setItem(k, v); } catch { /* 忽略 */ } },
   removeItem: (k) => { try { localStorage.removeItem(k); } catch { /* 忽略 */ } },
 }, "tank_rejoin_v1");
+// ── v3.0 稳定入口（本 Issue 的核心机制）────────────────────────────
+// 问题：临时地址会变（云原生环境重建换域名、隧道重开换域名、服务器换 IP），但玩家手里的链接是固定的。
+// 做法：服务器有内部 id（sid），链接形状 = <当前域名>/<sid>/join/<roomId>；
+//       服务器每次 welcome/pong 都会汇报「sid + 当前入口地址」，客户端据此：
+//         ① 自动匹配到最新地址（每次连接/重连都把稳定链接作为第一候选，服务器 302 到当前地址）；
+//         ② 刷新本地稳定链接（域名换了不用手动改，玩家复制出来的就是新域名 + 同一个 sid）。
+// 于是「变化的部分自动挂载到稳定之上」：只要服务器没重启，链接一直能用；
+//       中途断线/刷新也是走同一条链接（也许已经被 302 到新域名）自动回到同一批人同一房间。
+const entryMgr = new StableEntryManager({
+  getItem: (k) => { try { return localStorage.getItem(k); } catch { return null; } },
+  setItem: (k, v) => { try { localStorage.setItem(k, v); } catch { /* 忽略 */ } },
+  removeItem: (k) => { try { localStorage.removeItem(k); } catch { /* 忽略 */ } },
+}, "tank_stable_entry_v1");
+/** 当前稳定链接的站内路径（/<sid>/join/<roomId>）；没有 sid 时返回 null（退回普通寻址） */
+function stableEntryPath(roomId: number | null): string | null {
+  const sid = entryMgr.peek()?.sid ?? net.sid;
+  if (!sid) return null;
+  return entryPathOf(sid, roomId);
+}
+/** 稳定链接候选：优先同源（当前域名已被 302 到正确环境），其次服务器汇报的当前入口地址 */
+function stableEntryCandidates(): string | null {
+  const room = onlineCurrent?.id ?? autoJoinRoom ?? null;
+  const path = stableEntryPath(room ?? null);
+  if (!path) return null;
+  const wsUrl = (origin: string) => `${origin.replace(/^http/i, "ws").replace(/\/+$/, "")}${path}`;
+  const sameOrigin = `${wsProto()}://${location.host}${path}`;
+  const entryUrl = net.entryUrl;
+  if (entryUrl && entryUrl !== location.origin) {
+    // 当前域名变了（或手里链接是旧域名）→ 先试服务器汇报的最新入口
+    const latest = wsUrl(entryUrl);
+    const shared = sharedHost ? `${wsProto()}://${sharedHost}` : null;
+    return shared && shared === entryUrl ? sameOrigin : latest;
+  }
+  return sameOrigin;
+}
+/** 服务器汇报新 sid/入口 → 自动滚动更新本地稳定链接（同一进程内 sid 不变，无需重新分享） */
+function onEntryReport(sid: string, url: string | null): void {
+  if (!sid) return;
+  const prev = entryMgr.peek();
+  const same = prev && prev.sid === sid;
+  if (!same) {
+    entryMgr.adopt(sid, url ?? undefined, onlineCurrent?.id ?? autoJoinRoom ?? null);
+    console.log(`[稳定入口] 已自动匹配服务器内部 id ${sid}${prev ? `（原 ${prev.sid}，环境已重建 → 请重新分享链接）` : ""}`);
+    if (prev) notifyOnline("服务器已重建，链接已自动更新，请重新分享给好友");
+  } else if (url) {
+    entryMgr.adopt(sid, url, onlineCurrent?.id ?? autoJoinRoom ?? null);
+  }
+  if (serverPublicHost && prev?.sid === sid) keepStableEntryForHost(serverPublicHost);
+}
+/** 公网域名变化（服务器动态学习到新隧道域名）→ 稳定链接自动挂到新域名上 */
+function keepStableEntryForHost(host: string): void {
+  const card = entryMgr.peek();
+  if (!card) return;
+  entryMgr.save({ ...card, url: `https://${host}${entryPathOf(card.sid, card.roomId ?? null)}` });
+}
 function saveRejoinCard(tableId: number, token: string): void { rejoinMgr.save({ tableId, token }); }
 function peekRejoinCard(): { tableId: number; token: string } | null { return rejoinMgr.peek(); }
 function clearRejoinCard(): void { rejoinMgr.clear(); }
@@ -281,6 +336,24 @@ let autoJoinRoom: number | null = (() => {
   return Number.isFinite(r) && r > 0 ? r : null;
 })();
 
+// ── v3.0 稳定入口自动学习：链接形如 /<sid>/join/<roomId>（302 后到达页面，路径仍可解析）──
+// 页面地址 / 当前域名 里只要带得出 sid，就记下来 —— 之后无论是断线重连、刷新、
+// 还是把链接再分享给别人，都能自动匹配到「当前实际地址」。
+(function learnStableEntryFromUrl() {
+  const fromPath = parseStableEntry(location.href);
+  if (fromPath) {
+    const prev = entryMgr.peek();
+    entryMgr.save({ sid: fromPath.sid, roomId: fromPath.roomId ?? autoJoinRoom ?? prev?.roomId ?? null, url: location.origin });
+    // 302 落回来时路径可能已被换成 "/?room=x"，此时 roomId 从 query 里补
+    if (autoJoinRoom != null) entryMgr.save({ sid: fromPath.sid, roomId: autoJoinRoom, url: location.origin });
+    console.log(`[稳定入口] 从链接学习到 sid=${fromPath.sid} room=${fromPath.roomId ?? autoJoinRoom ?? "-"}`);
+  }
+  // 另一个可能：管理员直接改地址栏（?entry=<sid>）或先用老链接（?room=x），都允许后续由 welcome 补 sid
+  const qs = new URLSearchParams(location.search);
+  const entrySid = (qs.get("entry") || "").trim().toLowerCase();
+  if (/^[0-9a-f]{8}$/.test(entrySid)) entryMgr.save({ sid: entrySid, roomId: autoJoinRoom, url: location.origin });
+})();
+
 /** v2.10 快照增量解码器（成员端把增量帧重建为完整快照再喂 RemoteView）——net-sync-core SyncCodec */
 const snapCodec = new SyncCodec(TANK_SYNC_SCHEMA);
 (window as any).__snapCodec = snapCodec;   // 调试句柄（可视化 e2e 断言缓存状态）
@@ -341,6 +414,19 @@ function autoLearnPublicHost() {
 }
 
 
+/** 可分享的「当前域名 origin」：服务器自动学习的公网域名 > 页面自身域名（排除 localhost）；没有则 "" */
+function getSharedOrigin(): string {
+  if (serverPublicHost) {
+    const clean = serverPublicHost.trim().replace(/^https?:\/\//, "").replace(/[\/].*$/, "");
+    if (clean && !/^localhost|^127\./.test(clean)) return `https://${clean}`;
+  }
+  const h = location.hostname;
+  if (!h || h === "localhost" || h === "127.0.0.1" || h === "0.0.0.0") return "";
+  const isLan = /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h);
+  if (isLan && location.port === "3001") return `${location.protocol}//${h}:3001`;
+  return location.origin;
+}
+
 /**
  * 生成当前房间的邀请链接。
  * 关键规则：链接里绝不能出现 localhost / 127.0.0.1 —— 那在好友设备上指向他自己。
@@ -348,6 +434,17 @@ function autoLearnPublicHost() {
  *  - 本机用 localhost 打开 → 用服务器在 welcome 中报告的真实局域网 IP 替换。
  */
 function buildInviteUrl(roomId: number): string {
+  // ⓿ v3.0 稳定入口：链接形状 = <当前域名>/<sid>/join/<roomId>。
+  //    域名用「当前实际域名」（服务器自动学习的公网域名 > 页面自身域名），sid 恒定；
+  //    好友打开这条链接时由服务器 302 自动匹配到最新可用地址 → 域名变了链接也不用改。
+  const entryPath = stableEntryPath(roomId);
+  if (entryPath) {
+    const origin = getSharedOrigin();
+    if (origin) return `${origin}${entryPath}`;
+    // 本机打开（localhost）：退回服务器的局域网 IP，同样带稳定入口路径（仅同 WiFi 可用）
+    const lan = serverLanIps[0] || sharedHost;
+    if (lan) return `http://${lan}:${location.port || 3001}${entryPath}`;
+  }
   // ① 服务器动态学习的公网隧道域名（自动适配隧道变化，最优先）
   if (serverPublicHost) return `https://${serverPublicHost}/?room=${roomId}`;
   // ② 手动配置/记忆的公网域名（兜底）
@@ -648,7 +745,8 @@ function enterOnline(): void {
   onlineInTable = false;
   onlineCurrent = null;
   onlineSel = 0;
-  notifyOnline("正在连接联机服务器…");
+  const stable = entryMgr.peek();
+  notifyOnline(stable ? "正在连接联机服务器（稳定入口自动匹配中…）" : "正在连接联机服务器…");
 }
 
 function exitOnlineToMenu(): void {
@@ -676,18 +774,20 @@ function returnToOnlineLobby(): void {
 }
 
 function wireNetHandlers(): void {
+  net.setEntryLink(() => stableEntryCandidates());   // 稳定链接永远是第一寻址候选（自动匹配）
+  net.on("entry", (e) => onEntryReport(e.sid, e.url));
   net.on("tables", (tables) => {
     onlineTables = tables;
     tablesSynced = true;   // v2.25 已同步：允许"快速加入/开房"直接决策
-    // 服务器每次广播都带最新公网域名 → 邀请链接实时自动适配
-    if (net.publicHost) serverPublicHost = net.publicHost;
+    // 服务器每次广播都带最新公网域名 → 邀请链接实时自动适配（稳定链接同步换域名）
+    if (net.publicHost) { serverPublicHost = net.publicHost; keepStableEntryForHost(net.publicHost); }
   });
   net.on("welcome", () => {
     // 记录服务器报告的真实局域网地址（生成邀请链接用）
     const si = net.serverInfo;
     if (si && si.lanIps.length) serverLanIps = si.lanIps;
     // 服务器动态学习的公网隧道域名（隧道重启/域名变化时自动更新，无需手动配置）
-    if (net.publicHost) serverPublicHost = net.publicHost;
+    if (net.publicHost) { serverPublicHost = net.publicHost; keepStableEntryForHost(net.publicHost); }
     // 页面经公网隧道打开 → 自动记住该域名（兜底：本地手动模式）
     autoLearnPublicHost();
     // v2.19 连接后主动拉取桌子列表（不依赖服务器广播时序，避免大厅空表）
@@ -1342,8 +1442,8 @@ function renderOnline(W: number, H: number): void {
     renderer.ctx.fillStyle = isPub ? "#8fff8f" : "#ffaa00";
     renderer.ctx.textAlign = "center";
     renderer.ctx.fillText(isPub
-      ? "邀请链接 · 公网·自动适配（远程好友可访问）："
-      : "邀请链接 · 局域网（仅同 WiFi，服务器学到公网域名后自动切换）：",
+      ? "邀请链接 · 稳定入口（换域名/换 IP 自动匹配，远程好友可访问）："
+      : "邀请链接 · 稳定入口·局域网（仅同 WiFi；服务器学到公网域名后自动切换到公网）：",
       W / 2, H - 134);
     renderer.ctx.fillStyle = "#66ccff";
     renderer.ctx.fillText(shown, W / 2, H - 118);

@@ -117,6 +117,25 @@ line("  ⚠ 以上是本机/局域网地址，好友打不开；要出公网且�
 line("=========================================================");
 line();
 
+// ── 稳定入口（分享给好友的链接形状）──────────────────────────────
+// 临时地址会变（环境重建换域名），但内部 id 恒定 → 链接不变；变了也由服务器 302 自动匹配。
+try {
+  const probe = publicUrl || `http://127.0.0.1:${PORT}`;
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), 8000);
+  const res = await fetch(probe + "/healthz", { signal: ac.signal });
+  clearTimeout(t);
+  const j = await res.json();
+  if (j && j.sid) {
+    line("  ── 稳定入口（发给好友的链接，换域名/换 IP 都自动匹配）──");
+    line(`  稳定链接:   ${(publicUrl || `http://127.0.0.1:${PORT}`)}/${j.sid}/join/`);
+    line(`  服务器内部 id: ${j.sid}（同一进程内恒定）`);
+    line(`  当前入口:   ${j.current || "-"}   |  自动匹配表: ${j.matched} 条`);
+    line(`  ⚠ 环境重建/服务器重启后内部 id 会换新 → 需要重新分享一条链接（其余情况无需改链接）`);
+    line();
+  }
+} catch { /* healthz 拿不到就跳过（服务器可能没起，下面已有提示） */ }
+
 if (publicUrl) {
   line("=== 探测预览地址是否为游戏服务 ===");
   const r = await probe(publicUrl);
