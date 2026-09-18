@@ -233,7 +233,8 @@ function tryStartP2P(start: { myIndex: number; players: Array<{ clientId: number
   } catch { return null; }
 }
 let serverLanIps: string[] = [];   // 服务器在 welcome 里报告的本机局域网 IP（生成邀请链接用）
-let serverPublicHost: string | null = null; // 服务器动态学习的公网隧道域名（自动适配，勿写死）
+// 服务器**可信来源**确立的当前入口域名（v3.0.1：不再从进站 Host 学习，Host 可伪造）
+let serverPublicHost: string | null = null;
 let onlineName = localStorage.getItem("tank_online_name") || "玩家";
 let onlineTables: NetTable[] = [];
 // v2.25 是否已收到过服务器桌子列表：未同步前不自动建房（避免连接时序空窗误建重复房）
@@ -435,8 +436,10 @@ function getSharedOrigin(): string {
  */
 function buildInviteUrl(roomId: number): string {
   // ⓿ v3.0 稳定入口：链接形状 = <当前域名>/<sid>/join/<roomId>。
-  //    域名用「当前实际域名」（服务器自动学习的公网域名 > 页面自身域名），sid 恒定；
+  //    域名用「当前实际域名」（**服务器可信来源确立的入口域名** > 页面自身域名），sid 恒定；
   //    好友打开这条链接时由服务器 302 自动匹配到最新可用地址 → 域名变了链接也不用改。
+  //    ⚠ v3.0.1：服务器不再**学习**进站 Host（Host 可伪造，会被劫持成钓鱼链接），
+  //      所以这里的域名只可能是「服务器可信入口」或「页面自己所在的域名」——两者都不是 caller 自报。
   const entryPath = stableEntryPath(roomId);
   if (entryPath) {
     const origin = getSharedOrigin();
@@ -445,7 +448,7 @@ function buildInviteUrl(roomId: number): string {
     const lan = serverLanIps[0] || sharedHost;
     if (lan) return `http://${lan}:${location.port || 3001}${entryPath}`;
   }
-  // ① 服务器动态学习的公网隧道域名（自动适配隧道变化，最优先）
+  // ① 服务器可信来源确立的当前入口域名（隧道/环境域名变了，客户端由 welcome/pong 自动刷新）
   if (serverPublicHost) return `https://${serverPublicHost}/?room=${roomId}`;
   // ② 手动配置/记忆的公网域名（兜底）
   const pub = getPublicHost();
@@ -779,7 +782,7 @@ function wireNetHandlers(): void {
   net.on("tables", (tables) => {
     onlineTables = tables;
     tablesSynced = true;   // v2.25 已同步：允许"快速加入/开房"直接决策
-    // 服务器每次广播都带最新公网域名 → 邀请链接实时自动适配（稳定链接同步换域名）
+    // 服务器每次广播都带最新公网域名（来自可信来源）→ 邀请链接实时自动适配（稳定链接同步换域名）
     if (net.publicHost) { serverPublicHost = net.publicHost; keepStableEntryForHost(net.publicHost); }
   });
   net.on("welcome", () => {

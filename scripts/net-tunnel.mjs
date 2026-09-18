@@ -119,18 +119,54 @@ line();
 
 // ── 稳定入口（分享给好友的链接形状）──────────────────────────────
 // 临时地址会变（环境重建换域名），但内部 id 恒定 → 链接不变；变了也由服务器 302 自动匹配。
+//
+// 【可信入口登记】服务器**不采信任何请求自报的 Host**（Host 可伪造，会把别人的分享链接指向攻击者域名）。
+// 所以公网入口只能由「能进容器/能读落盘令牌」的部署脚本登记：
+//   ① 服务器启动时把一次性令牌写到 $TANK_ENTRY_TOKEN_FILE（默认 /tmp/tank-entry-<port>.token，0600）；
+//   ② 本脚本（部署者身份）读它 → 调 /entry/register?url=<公网域名> 显式登记当前入口；
+//   ③ 落盘一份到 <token file>.url，供无 HTTP 通路时的环境使用（服务器每次刷新都会读）。
+// 于是：换域名后跑一次 net:tunnel 就能把稳定链接自动指到新域名，且攻击者伪造 Host 完全无效。
+const probeBase = publicUrl || `http://127.0.0.1:${PORT}`;
+async function registerTrustedEntry(origin) {
+  if (!origin) return false;
+  const tokenFile = process.env.TANK_ENTRY_TOKEN_FILE || `/tmp/tank-entry-${PORT}.token`;
+  let token = "";
+  try { token = (await import("node:fs")).readFileSync(tokenFile, "utf8").trim(); } catch { /* 没有令牌（非本机部署者）→ 跳过 */ }
+  if (!token) return false;
+  try {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), 5000);
+    const res = await fetch(`http://127.0.0.1:${PORT}/entry/register?url=${encodeURIComponent(origin)}`, {
+      headers: { "X-Tank-Entry-Token": token }, signal: ac.signal,
+    });
+    clearTimeout(t);
+    const j = await res.json().catch(() => null);
+    if (res.ok && j && j.ok) {
+      try { (await import("node:fs")).writeFileSync(tokenFile + ".url", origin + "\n", "utf8"); } catch {}
+      line(`  ▸ 已登记「当前入口」= ${j.current}（带令牌的可信登记，伪造 Host 无法改写）`);
+      return true;
+    }
+    line(`  ▸ 入口登记未生效（HTTP ${res.status}）；稳定链接仍按服务器现有入口跳转`);
+  } catch (e) {
+    line(`  ▸ 入口登记失败（${e && e.message}）；稳定链接仍按服务器现有入口跳转`);
+  }
+  return false;
+}
 try {
-  const probe = publicUrl || `http://127.0.0.1:${PORT}`;
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), 8000);
-  const res = await fetch(probe + "/healthz", { signal: ac.signal });
+  const res = await fetch(probeBase + "/healthz", { signal: ac.signal });
   clearTimeout(t);
   const j = await res.json();
   if (j && j.sid) {
     line("  ── 稳定入口（发给好友的链接，换域名/换 IP 都自动匹配）──");
-    line(`  稳定链接:   ${(publicUrl || `http://127.0.0.1:${PORT}`)}/${j.sid}/join/`);
+    // 先用可信令牌把「本次的实际公网域名」登记为当前入口（换域名后链接自动跟上新域名）
+    await registerTrustedEntry(publicUrl);
+    const after = await fetch(probeBase + "/healthz").then((r) => r.json()).catch(() => j);
+    const entryOrigin = after.current || publicUrl || probeBase;
+    line(`  稳定链接:   ${entryOrigin}/${j.sid}/join/`);
     line(`  服务器内部 id: ${j.sid}（同一进程内恒定）`);
-    line(`  当前入口:   ${j.current || "-"}   |  自动匹配表: ${j.matched} 条`);
+    line(`  当前入口:   ${after.current || "-"}   |  自动匹配表: ${after.matched} 条`);
     line(`  ⚠ 环境重建/服务器重启后内部 id 会换新 → 需要重新分享一条链接（其余情况无需改链接）`);
     line();
   }
