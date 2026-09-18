@@ -25,14 +25,21 @@ npm run net:tunnel -- --test   # 探测"是不是游戏服务" + 实测延迟
 bash deploy/start-server.sh 3001
 ```
 
-等价的手工步骤（注意最后一步的登记，别漏）：
+> **玩家视角（Issue #11）：入口不再需要任何手动前置。**
+> 服务器启动时自己找一次对外入口（平台模板 → `TANK_PUBLIC_ENTRY` → 本机公网 IP → 局域网 IP）
+> 并落盘，容器一起来就能玩；下面那条 `curl` 登记只是**可选**的（用来指定公网 IP 或自有域名，
+> 让异地好友优先走你指定的地址）。要固定指定就传 `-e TANK_PUBLIC_ENTRY=http://<域名或IP>:3001`，
+> 同样零手动步骤。完全不想要自动登记（只认显式令牌登记）就 `-e TANK_AUTO_ENTRY=0`。
+
+等价的手工步骤（登记是**可选**的，跑不跑都能玩）：
 
 ```bash
 docker build -f deploy/Dockerfile -t tank-online .   # 前端在镜像里构建，宿主无需 npm run build
 mkdir -p "$PWD/.tank-deploy"
 docker run -d --name tank -p 3001:3001 --restart=always \
   -e TANK_ENTRY_TOKEN_FILE=/data/entry.token -v "$PWD/.tank-deploy:/data" tank-online
-# 登记「对外入口」（IP 形态也要登记，否则稳定链接没有 302 目标）：
+# （可选）显式登记「对外入口」——指定优先用哪个地址（IP 形态也认）：
+#   不跑这条也没关系：服务器启动时会自动登记本机公网/局域网 IP。
 curl -H "X-Tank-Entry-Token: $(cat .tank-deploy/entry.token)" \
   "http://127.0.0.1:3001/entry/register?url=http://203.0.113.9:3001"
 ```
@@ -150,5 +157,12 @@ curl -s http://127.0.0.1:3001/healthz                     # {"ok":true,...}
 curl -s http://127.0.0.1:3001/healthz   # {"current":"http://203.0.113.9:3001","currentSource":"register",...}
 ```
 
-⚠ 没有登记（也没有平台预览模板）时，稳定链接**不会**把好友送到 127.0.0.1，
-而是给一页可操作提示（告诉你补哪条命令）——这是 v3.0.2 起的行为。
+**入口从哪来（v3.0.3 起，优先级由高到低）**：
+1. 带令牌的**显式登记**（你说了算，不被别的来源顶回）；
+2. 平台注入的预览模板（云原生开发环境自带，已做残留占位符校验）；
+3. 服务器**自己找**的本机入口（`TANK_PUBLIC_ENTRY` → 本机公网 IP → 局域网 IP），并落盘 —— 零手动步骤。
+4. 玩家那侧如发现登记入口连不上（后端网络不通），会就地用「实际能连到的地址」开玩，
+   并允许修正一次（仅在**已有登记入口**时，避免请求方自报地址变成入口）。
+
+⚠ 上述全部拿不到时（完全离线/无网卡），稳定链接**不会**把好友送到 127.0.0.1，
+而是给一页可操作提示；本机/同一内网打开的访问者会在该页看到「直接开玩」并自动进游戏。

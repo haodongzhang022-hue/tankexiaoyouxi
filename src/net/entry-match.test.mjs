@@ -117,6 +117,9 @@ async function startServer(opts = {}) {
       TANK_ENTRY_TOKEN_FILE: tokenFile,
       TANK_KEEPALIVE: "0",
       PUBLIC_URL_FILE: path.join(dir, "public-url.txt"),
+      // 默认关掉「服务器自找入口」：老用例锁的是「没有可信来源时 current 必须为空」，
+      // 自动登记会把它变成非空 → 老回归锁失效。要测自动登记的用例显式打开（TANK_AUTO_ENTRY=1）。
+      TANK_AUTO_ENTRY: "0",
       // 清掉可能存在的预览模板：本测试要的是「没有可信来源时 current 保持为空」
       CNB_VSCODE_PROXY_URI: "",
       CNB_VSCODE_PROXY_URI_HTTPS: "",
@@ -437,4 +440,100 @@ test("心跳保鲜：有客户端连着时 /healthz 的 lastClientSeenS 有值",
   assert.equal(pong.sid, SID, "pong 应回带 sid（客户端据此自动匹配）");
   ws.close();
   assert.equal(typeof (await health(s.base)).lastClientSeenS, "number", "有活人连过 → 有秒数");
+});
+
+// ── Issue #11 核心：玩家视角「打开就能玩」────────────────────────────
+// 病根：入口只能靠「读得到 0600 令牌」的手动登记 → 非 root / 直接 node 跑的玩家拿不到入口，
+//       点开邀请链接只看到「还没有对外入口」提示页。
+// 修法：服务器启动时自己找一次对外入口（模板 → TANK_PUBLIC_ENTRY → 本机公网 IP → 局域网 IP）
+//       并落盘；「可写令牌文件目录」= 部署者身份，所以 root / 非 root 都成立。
+
+test("🔴 回归（Issue #11）：服务器自己登记本机入口 → 打开页面直接能玩，无需任何手动前置", async (t) => {
+  const s = await startServer({ env: { TANK_AUTO_ENTRY: "1", TANK_PUBLIC_ENTRY: "http://203.0.113.9:3001" } });
+  t.after(() => s.stop());
+
+  const h = await health(s.base);
+  assert.equal(h.current, "http://203.0.113.9:3001", "启动即应有入口（不再要求玩家先跑 curl）");
+  assert.equal(h.currentSource, "register");
+
+  // 玩家点稳定链接 → 直接 302 进游戏，不是「还没有对外入口」拦路页
+  const r = await redirectOf(`${s.base}/${SID}/join/7`);
+  assert.equal(r.status, 302);
+  assert.equal(r.location, "http://203.0.113.9:3001/?room=7");
+  assert.ok(!/还没有对外入口/.test(r.body), "不该再看到「没有入口」拦住玩家");
+
+  // 落盘 → 重启后依然生效（不依赖任何手动步骤）
+  assert.equal(fs.readFileSync(s.tokenFile + ".url", "utf8").trim(), "http://203.0.113.9:3001");
+});
+
+test("🔴 回归（Issue #11）：显式登记优先级高于自动登记（自动登记不覆盖部署者选择）", async (t) => {
+  const s = await startServer({ env: { TANK_AUTO_ENTRY: "1", TANK_PUBLIC_ENTRY: "http://198.51.100.7:3001" } });
+  t.after(() => s.stop());
+  assert.equal((await health(s.base)).current, "http://198.51.100.7:3001");
+
+  // 部署者随后显式登记自己的域名 → 必须以它为准，且不被自动登记/模板刷新顶回
+  const r = await register(s.base, "https://my.domain.example", s.token);
+  assert.equal(r.json.current, "https://my.domain.example");
+  for (let i = 0; i < 3; i++) {
+    await health(s.base);
+    assert.equal((await health(s.base)).current, "https://my.domain.example", "显式登记必须一直赢");
+  }
+});
+
+test("🔴 回归（Issue #11）：玩家访问到「非服务器入口」的地址时能看到自动自救入口", async (t) => {
+  // 场景：反代/隧道把玩家送到了别的地址（页面与 WS 不同源），此时不能把玩家拦在「没有入口」页上——
+  // 只要这个端口打得开，本机/内网访问者就必须看得到「直接开玩」的按钮与自动跳转。
+  const s = await startServer();
+  t.after(() => s.stop());
+
+  const r = await rawGet(`${s.base}/${SID}/join/7`, { host: "127.0.0.1" });
+  assert.equal(r.status, 200);
+  assert.match(r.body, /还没有对外入口/);
+  assert.match(r.body, /直接开玩/, "本机访问者应看到「直接开玩」入口");
+  assert.match(r.body, /location\.replace\("\/"\)/, "本机访问者应被自动带回游戏页（而不是干等）");
+
+  // 远程访问者（公网域名 Host）不该看到「本机直接开玩」的自动跳转
+  const remote = await rawGet(`${s.base}/${SID}/join/7`, { host: "203.0.113.9:3001" });
+  assert.ok(!/直接开玩/.test(remote.body), "远程访问者不该被告知「服务器就在你身边」");
+});
+
+test("🔴 回归（Issue #11）：/__whoami 暴露 sid + 当前入口（页面据此自愈到正确入口）", async (t) => {
+  const s = await startServer({ env: { TANK_AUTO_ENTRY: "1", TANK_PUBLIC_ENTRY: "http://203.0.113.9:3001" } });
+  t.after(() => s.stop());
+  const who = await (await fetch(s.base + "/__whoami")).json();
+  assert.equal(who.kind, "game-server");
+  assert.equal(who.sid, SID);
+  assert.equal(who.current, "http://203.0.113.9:3001");
+  assert.equal(who.entryPath, `/${SID}/join/`);
+});
+
+test("🔴 回归（Issue #11）：入口从玩家那侧连不上时，允许按「实际能连到的地址」修正", async (t) => {
+  const s = await startServer({ env: { TANK_AUTO_ENTRY: "1", TANK_PUBLIC_ENTRY: "http://203.0.113.9:3001" } });
+  t.after(() => s.stop());
+  assert.equal((await health(s.base)).current, "http://203.0.113.9:3001");
+
+  // 玩家（后端网络到不了登记的入口）上报「我这里实际能连到 198.51.100.20:3001」
+  const r = await fetch(`${s.base}/entry/localtip?origin=${encodeURIComponent("http://198.51.100.20:3001")}`);
+  const j = await r.json();
+  assert.equal(r.status, 200);
+  assert.equal(j.applied, true);
+  assert.equal(j.previous, "http://203.0.113.9:3001");
+  assert.equal(j.current, "http://198.51.100.20:3001");
+  assert.equal((await health(s.base)).current, "http://198.51.100.20:3001", "入口应被修正为玩家真的连得上的地址");
+  const red = await redirectOf(`${s.base}/${SID}/join/4`);
+  assert.equal(red.location, "http://198.51.100.20:3001/?room=4");
+});
+
+test("🔴 回归（Issue #11）：没有任何登记入口时，可达性上报不得凭请求方地址建立入口（钓鱼防线不退化）", async (t) => {
+  const s = await startServer();   // TANK_AUTO_ENTRY=0、无模板 → 没有入口
+  t.after(() => s.stop());
+  const r = await fetch(`${s.base}/entry/localtip?origin=${encodeURIComponent("https://phish.example.com")}`);
+  assert.equal(r.status, 409, "没有登记入口时必须拒绝，不能从无到有地建立入口");
+  assert.equal((await health(s.base)).current, null, "钓鱼域名不得成为当前入口");
+
+  // 回环地址同样不能借这条路径成为入口（回环永远不可分享）
+  await register(s.base, "http://203.0.113.9:3001", s.token);
+  const r2 = await fetch(`${s.base}/entry/localtip?origin=${encodeURIComponent("http://127.0.0.1:3001")}`);
+  assert.ok(r2.status >= 400, "回环地址仍不得成为入口");
+  assert.equal((await health(s.base)).current, "http://203.0.113.9:3001", "被拒时入口保持不变");
 });

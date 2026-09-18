@@ -44,6 +44,10 @@ EXPOSE 3001
 #   ① 部署脚本能读到令牌 → 带令牌登记「对外入口」（IP 形态也能登记，稳定链接才跳得对）；
 #   ② 登记结果（entry.token.url）重启后仍在，不用每次重新登记。
 ENV TANK_ENTRY_TOKEN_FILE=/data/entry.token
+# 玩家视角（Issue #11）：入口不需要任何手动前置 —— 服务器启动时自己找一次对外入口
+#   （平台模板 / 本机公网或局域网 IP）并落盘 .tank-deploy/entry.token.url，打开即玩。
+#   要指定域名/固定地址（反代、隧道）时：传 TANK_PUBLIC_ENTRY=http://<域名或IP>:<端口> 即可，同样零手动步骤。
+#   完全不想要自动登记（严格只认显式令牌登记）就设 TANK_AUTO_ENTRY=0。
 # 健康检查：打 /healthz（只证明进程活着，不依赖 dist 是否构建），
 # 端口用 ${PORT} 而不是硬编码 —— 否则 -e PORT=8080 时容器永远 unhealthy。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \

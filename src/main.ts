@@ -321,6 +321,11 @@ function getServerCandidates(): ServerCandidate[] {
     return [u];
   }
   const cands: ServerCandidate[] = [`${wsProto()}://${location.host}`];
+  // 手里有「稳定入口」（/<sid>/join/… 形态）时，把它也作为兜底候选：
+  // 链接被 302/反代送到一个连不上的地址时，直接改连服务器本身，由它把我带回当前入口。
+  // 玩家视角：不用懂这些，打开链接就是能玩（Issue #11）。
+  const stablePath = stableEntryPath(autoJoinRoom ?? null);
+  if (stablePath) cands.push(`${wsProto()}://${location.host}${stablePath}`);
   if (location.port !== "3001") {
     cands.push(() => {
       const h = sharedHost || location.hostname;
@@ -799,6 +804,81 @@ function returnToOnlineLobby(): void {
   notifyOnline("已返回大厅，重新选桌或新建房间");
 }
 
+/**
+ * v3.0.3 入口自愈：当前页面地址 != 服务器汇报的当前入口时，把浏览器带到正确入口
+ * （带上 sid + 房间号 → 到达后仍是同一个房间，稳定链接语义不变）。
+ * 只在「服务器有明确入口」且「当前页面不是这个入口」且「当前不是由 ?server= 指定服务器」时才跳，
+ * 避免多服务器/开发模式被误跳。
+ */
+async function reconcileEntryOrigin(): Promise<void> {
+  const target = serverPublicOrigin ? serverPublicOrigin.replace(/\/+$/, "") : "";
+  if (!target || !/^https?:\/\//i.test(target)) return;
+  // 只在**页面被送到了别的地址**时自愈（反代/隧道/后端网络把用户送到了非本服务的地址）。
+  // 同机打开（localhost / 本机网卡 IP 访问同一台服务器）属于房主自己开着玩，绝不跳 ——
+  // 跳了反而会把房主从他自己的页面踢走（体验倒退）。
+  const sameHost = location.hostname === new URL(target).hostname;
+  const isLocalView = /^(localhost|127\.|0\.0\.0\.0)$/i.test(location.hostname);
+  if (sameHost || isLocalView) return;
+  const qs = new URLSearchParams(location.search);
+  if (qs.get("server")) return;                                  // 显式指定别的服务器 → 不跳
+  if (location.origin === target) return;                        // 已经在正确入口上
+  const sid = net.sid;
+  if (!sid) return;
+  // 服务器可达性先确认一下：新入口打不开（如仅内网可达）就不跳，免得把玩家推到更差的地址
+  try {
+    const ac = new AbortController();
+    const to = setTimeout(() => ac.abort(), 2500);
+    const r = await fetch(`${target}/__whoami`, { signal: ac.signal, cache: "no-store" });
+    clearTimeout(to);
+    if (!r.ok) return;
+    const j = await r.json().catch(() => null);
+    if (!j || j.sid !== sid) return;                             // 别跳到另一台服务器上
+  } catch { return; }
+  const room = onlineCurrent?.id ?? autoJoinRoom ?? entryMgr.peek()?.roomId ?? null;
+  const url = `${target}/${sid}/join/${room != null ? room : ""}`;
+  console.log(`[稳定入口] 当前页面入口( ${location.origin} )与服务器入口( ${target} )不一致，自动带你过去`);
+  notifyOnline("正在带你到正确的服务器入口…");
+  location.replace(url);
+}
+
+/**
+ * v3.0.3「玩家视角」：服务器登记的入口**从我这台机器连不上**时的自救。
+ *
+ * 场上真实故障（Issue #11 用户描述）：服务器对外登记的入口（公网 IP/域名）在后端网络里访问不到 ——
+ * 页面能打开（说明这个地址是通的），但任何指向「那个入口」的链接、跳转、分享都等于把玩家送进死路。
+ * 玩家要的是「点开就能玩」，不是「先去验证入口可达性」。
+ *
+ * 所以：一旦发现入口连不上，就把「我实际打开的这个地址」当作可用入口用起来 ——
+ *   ① 本地稳定入口落成当前地址（断线重连/刷新继续走它，不再绕远路去不可达的入口）；
+ *   ② 告诉服务器「这台机器从哪个地址能连到你」（仅在其**已经登记过入口**时用于修正，
+ *      未登记时不动：避免把「请求方自报的 Host」重新引回来当入口，那是之前的钓鱼漏洞）。
+ */
+async function ensureLocalPlayableEntry(): Promise<void> {
+  const target = serverPublicOrigin ? serverPublicOrigin.replace(/\/+$/, "") : "";
+  const sid = net.sid;
+  if (!sid) return;
+  const origin = location.origin;
+  if (/^https?:\/\//i.test(target) && target !== origin) {
+    let reachable = false;
+    try {
+      const ac = new AbortController();
+      const to = setTimeout(() => ac.abort(), 2500);
+      const r = await fetch(`${target}/__whoami`, { signal: ac.signal, cache: "no-store" });
+      clearTimeout(to);
+      reachable = r.ok;
+    } catch { reachable = false; }
+    if (reachable) return;                                       // 入口可达：保持现状，不必自救
+    console.log(`[稳定入口] 登记的入口 ${target} 从本机连不上 → 就地使用当前地址 ${origin}`);
+    notifyOnline("当前网络连不上服务器登记的入口，已就地用你打开的这个地址开玩");
+  }
+  // ① 本地稳定入口 = 当前实际可用的地址（玩家刷新/断线重连走它）
+  entryMgr.save({ sid, roomId: onlineCurrent?.id ?? autoJoinRoom ?? entryMgr.peek()?.roomId ?? null, url: origin });
+  // ② 服务器已登记过入口 → 允许它按「这台机器实际能连到的地址」修正一次（仅此情形，避免请求方自报 Host 复活）
+  try {
+    await fetch("/entry/localtip?origin=" + encodeURIComponent(origin), { cache: "no-store" });
+  } catch { /* 失败不影响开玩 */ }
+}
+
 function wireNetHandlers(): void {
   net.setEntryLink(() => stableEntryCandidates());   // 稳定链接永远是第一寻址候选（自动匹配）
   net.on("entry", (e) => onEntryReport(e.sid, e.url));
@@ -818,6 +898,14 @@ function wireNetHandlers(): void {
     if (net.publicOrigin) { serverPublicOrigin = net.publicOrigin; keepStableEntryForOrigin(net.publicOrigin); }
     // 页面经公网隧道打开 → 自动记住该域名（兜底：本地手动模式）
     autoLearnPublicHost();
+    // v3.0.3「玩家视角」自愈：这条页面如果不是从服务器自己的入口打开的（反代/隧道把用户送到了
+    // 别的地址，页面与 WebSocket 不同源），服务器已经告诉了我们正确入口 —— 自动带过去，
+    // 玩家不需要理解「入口 / 反代 / 域名」是什么，打开链接就是能玩（Issue #11）。
+    // 放在 welcome 之后一小段延迟：welcome 里刚拿到的入口要先落到 serverPublicOrigin，
+    // 而 welcome 只保证「有地址」，不保证「页面已经被送到那个地址」（反代/多跳场景）。
+    setTimeout(() => { void reconcileEntryOrigin(); }, 600);
+    // 反向场景：登记的入口从本机根本连不上（后端网络不通）→ 就地用当前地址开玩，别让玩家卡住
+    setTimeout(() => { void ensureLocalPlayableEntry(); }, 1400);
     // v2.19 连接后主动拉取桌子列表（不依赖服务器广播时序，避免大厅空表）
     net.list();
     // 带邀请链接打开：连上后自动加入目标房间（重连卡优先于邀请链接，避免已开始的对局被 join 拒绝）

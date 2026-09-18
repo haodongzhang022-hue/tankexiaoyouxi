@@ -38,8 +38,10 @@ if [ -n "$IP" ] && [ "$IP" != "127.0.0.1" ]; then PUBLIC_ENTRY="http://${IP}:${P
 if [ -z "$PUBLIC_ENTRY" ] && [ -n "${LAN_IP:-}" ]; then PUBLIC_ENTRY="http://${LAN_IP}:${PORT}"; fi
 
 echo "==> 4/4 登记对外入口（稳定链接 302 的目标；IP 形态无需域名）"
-# 这一步以前缺失 → 没有域名的部署形态拿不到「当前入口」，好友点开会被送到他自己的 127.0.0.1。
-# 现在：把上面算出的入口用**带令牌的可信登记**写进服务器（并落盘，重启后仍生效）。
+# 说明（Issue #11）：服务器启动时会**自己**找一次对外入口（平台模板 / 本机公网或局域网 IP）并落盘，
+#   所以这一步对玩家来说不再是前置 —— 不跑也能玩。这里额外用算出来的公网 IP 显式登记一次，
+#   是为了优先选「公网 IP」而不是局域网 IP（同一台机器上，公网 IP 让异地好友也能连）。
+#   拿不到令牌（例如非 root 启动且读不到容器内文件）时**不再当成失败**：自动登记已经兜住了。
 TOKEN_FILE="${TOKEN_DIR}/entry.token"
 TOKEN=""
 for i in $(seq 1 10); do
@@ -56,10 +58,18 @@ if [ -n "$TOKEN" ] && [ -n "$PUBLIC_ENTRY" ]; then
   echo "    登记结果: ${REG:-（无响应）}"
   case "$REG" in
     *'"applied":true'*) echo "    ✓ 当前入口 = ${PUBLIC_ENTRY}" ;;
-    *) echo "    ⚠ 登记未生效，稳定链接会退化为可操作提示页；请检查上面返回的原因" ;;
+    *) echo "    · 显式登记未生效（不影响开玩）：服务器启动时的自动登记会兜住；下面看 healthz 即可确认" ;;
   esac
 else
-  echo "    ⚠ 跳过登记（令牌未就绪或没算出可用 IP）—— 稳定链接将提示「服务器还没有对外入口」"
+  echo "    · 未读到令牌/未算出公网 IP —— 不影响开玩：服务器启动时会自动登记本机对外入口"
+fi
+# 入口自证：不管上面走哪条路，这里都看一眼服务器最终采用的入口（玩家能不能直接玩就看它）
+ENTRY_NOW=$(curl -fsS "http://127.0.0.1:${PORT}/healthz" 2>/dev/null | sed -n 's/.*"current":"\([^"]*\)".*/\1/p')
+if [ -n "$ENTRY_NOW" ]; then
+  echo "    ✓ 服务器当前入口 = ${ENTRY_NOW}（自动登记/显式登记取其一，玩家打开即可玩）"
+else
+  echo "    ⚠ 服务器还没有对外入口：把 http://<这台机器的公网IP>:${PORT} 直接发给好友也能玩；"
+  echo "      或在 .tank-deploy/ 下放一个 entry.url（内容为 http://<公网IP>:${PORT}）后重启容器即可。"
 fi
 
 echo

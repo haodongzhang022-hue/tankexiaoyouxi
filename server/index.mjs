@@ -17,6 +17,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import dgram from "node:dgram";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket } from "ws";
 // 预览地址变量表/落盘读写的「单一事实源」（与 scripts/net-tunnel.mjs 共用同一份，避免漂移）
@@ -24,7 +25,7 @@ import { WebSocketServer, WebSocket } from "ws";
 //   detectPreviewUrl 内部使用 —— 服务器不再自己拼模板域名（Issue #11 评审 🔴3：自拼会产出未校验的垃圾域名）。
 import { detectPreviewUrl, writePublicUrl, PUBLIC_URL_FILE } from "../shared/preview-url.mjs";
 // 「稳定入口 ↔ 当前临时地址」自动匹配表（与共享层同一份实现，见 shared/entry-match.mjs）
-import { createEntryMatcher, entryPath, makeSid, SID_RE, ENTRY_TTL_MS, ENTRY_KEEPALIVE_MS, ENTRY_SWEEP_MS, normalizeOrigin, originScope, hasTemplatePlaceholder } from "../shared/entry-match.mjs";
+import { createEntryMatcher, entryPath, makeSid, SID_RE, ENTRY_TTL_MS, ENTRY_KEEPALIVE_MS, ENTRY_SWEEP_MS, normalizeOrigin, originScope, ipScope, hasTemplatePlaceholder } from "../shared/entry-match.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DIST_DIR = path.resolve(__dirname, "..", "dist");
@@ -74,6 +75,88 @@ function writeEntryTokenFile(file) {
 }
 writeEntryTokenFile(ENTRY_PROBE_TOKEN_FILE);
 
+/**
+ * 「部署者免手动登记」——玩家视角的兜底：服务器自己把对外入口找出来并登记。
+ *
+ * 为什么需要它（Issue #11：有玩家反馈「入口只有 root 能拿到，玩家拿不到可用的连接入口」）：
+ *   此前入口只能由**带 0600 令牌的手动登记**确立（`TANK_ENTRY_TOKEN_FILE` 权限 0600，默认属启动进程用户）。
+ *   部署脚本用 `docker exec` 读容器内 root 的令牌，或宿主机以 root 跑 —— 换成非 root 启动、或直接用
+ *   `node server/index.mjs` 跑的玩家，就**根本读不到令牌**，于是拿不到任何入口，点开邀请链接只会看到
+ *   「还没有对外入口」提示页 → 「有别的前置就算没开发成功」。
+ *
+ * 判定「可信部署者」用的不是 uid（root/非 root 都要能用），而是**服务器自己的令牌文件路径可写**：
+ *   能写 `$TANK_ENTRY_TOKEN_FILE` 的进程，本来就能直接改写登记结果（`<token>.url`），文件权限不构成任何
+ *   安全边界（进程内的 CURRENT_ORIGIN 同样可被它改写）。因此把「同机可写」当作可信，不降低安全性，
+ *   但把「玩家必须手动跑一条 curl」这个前置彻底去掉 —— 打开页面就能玩。
+ *
+ * 找入口的顺序（都是「非请求方自报」，所以不会引入 Host 伪造劫持）：
+ *   ① 平台预览模板（detectPreviewUrl，已做残留占位符校验）；
+ *   ② 显式传的 TANK_PUBLIC_ENTRY / TANK_PUBLIC_URL（部署脚本可用它指定域名，如反代域名）；
+ *   ③ 本机公网出口 IP（UDP dial 腾讯 DNS，任何联网机器都做得到）+ 本机网卡里的公网 IP；
+ *   ④ 局域网 IP（同 WiFi 直接可玩）。
+ * 拿不到任何地址就老实不登记（宁缺勿错：给可操作提示页，绝不把好友送到他自己的 127.0.0.1）。
+ * 可用 TANK_AUTO_ENTRY=0 关闭。
+ */
+async function autoRegisterLocalEntry() {
+  if (process.env.TANK_AUTO_ENTRY === "0") return;
+  // 已有入口（显式登记 / 平台模板）就不动它：显式登记永远优先，不被本兜底顶回
+  if (readRegisteredEntryOrigin()) return;
+  if (normalizeOrigin(CURRENT_ORIGIN)) return;
+  if (!canWriteEntryFiles()) {
+    console.log("[入口] 本机无令牌文件写权限（非部署者身份），跳过自动登记；入口仍由可信探针/模板决定");
+    return;
+  }
+  const explicit = normalizeOrigin(process.env.TANK_PUBLIC_ENTRY || process.env.TANK_PUBLIC_URL || "");
+  if (explicit && recordEntry(explicit, "auto", { allowPrivateIp: true })) {
+    writeRegisteredEntryOrigin(normalizeOrigin(CURRENT_ORIGIN));
+    console.log(`[入口] 已自动登记对外入口: ${CURRENT_ORIGIN}（来源：TANK_PUBLIC_ENTRY）`);
+    return;
+  }
+  const pub = await publicIp();
+  if (pub && recordEntry(`http://${pub}:${PORT}`, "auto", { allowPrivateIp: true })) {
+    writeRegisteredEntryOrigin(normalizeOrigin(CURRENT_ORIGIN));
+    console.log(`[入口] 已自动登记对外入口: ${CURRENT_ORIGIN}（公网 IP，好友打开即可玩）`);
+    return;
+  }
+  const lan = LAN_IPS[0];
+  if (lan && recordEntry(`http://${lan}:${PORT}`, "auto", { allowPrivateIp: true })) {
+    writeRegisteredEntryOrigin(normalizeOrigin(CURRENT_ORIGIN));
+    console.log(`[入口] 已自动登记对外入口: ${CURRENT_ORIGIN}（局域网 IP，同一 WiFi 可直接玩）`);
+    return;
+  }
+  console.log("[入口] 未找到可用对外地址（离线/无网卡）：稳定链接将给可操作提示页，不会指向 127.0.0.1");
+}
+
+/** 部署者身份判定（不看 uid，看能不能动服务器自己的入口文件） */
+function canWriteEntryFiles() {
+  try { fs.accessSync(path.dirname(ENTRY_PROBE_TOKEN_FILE), fs.constants.W_OK); return true; } catch { return false; }
+}
+
+/** 本机公网出口 IP（UDP dial，不发数据包）；失败/超时返回 ""。可被 TANK_PUBLIC_IP 覆盖。 */
+function publicIp() {
+  const forced = String(process.env.TANK_PUBLIC_IP || "").trim();
+  if (forced) return Promise.resolve(forced);
+  // 本机网卡上如果直接就是公网 IP（云主机常见），优先用它 —— 不依赖外网可达
+  const nicPublic = LAN_IPS.find((ip) => ipScope(ip) === "public");
+  if (nicPublic) return Promise.resolve(nicPublic);
+  return new Promise((resolve) => {
+    const sock = dgram.createSocket("udp4");
+    let done = false;
+    const finish = (v) => { if (done) return; done = true; try { sock.close(); } catch {} resolve(v); };
+    try {
+      sock.connect(80, "119.29.29.29");
+      sock.once("connect", () => {
+        try {
+          const a = sock.address();
+          const ip = a && a.address === "0.0.0.0" ? "" : a && a.address;
+          finish(ip && ipScope(ip) === "public" ? ip : "");
+        } catch { finish(""); }
+      });
+    } catch { finish(""); }
+    setTimeout(() => finish(""), 1500);
+  });
+}
+
 // ── 静态文件服务（dist/）─────────────────────────────────────────
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -119,6 +202,12 @@ const httpServer = http.createServer((req, res) => {
   let urlPath;
   try { urlPath = decodeURIComponent(new URL(req.url, "http://x").pathname); }
   catch { sendHtml(res, 400, "bad request"); return; }
+  const hostHeader = String(req.headers.host || "").toLowerCase();
+  // 访问者是不是「就在这台服务器本机 / 同一内网」打开的（Host 只用来做展示与自救跳转，绝不用于确立入口）
+  const hostNameOnly = hostHeader.replace(/:\d+$/, "").replace(/^\[|\]$/g, "");
+  const viewerIsLocal = hostNameOnly === "" || hostNameOnly === "localhost" || hostNameOnly.endsWith(".localhost")
+    || hostNameOnly === "::1" || hostNameOnly.startsWith("127.") || hostNameOnly === "0.0.0.0"
+    || /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(hostNameOnly);
   // ── 部署探针显式登记公网入口（需一次性令牌）────────────────────
   // 部署脚本（deploy/start-server.sh、net:tunnel）用它对公网域名显式登记/刷新「当前入口」，
   // 这样稳定链接既能在环境重建后自动跟上新域名，又不会被匿名请求伪造 Host 劫持。
@@ -147,6 +236,36 @@ const httpServer = http.createServer((req, res) => {
       note: persisted ? "已落盘，服务器重启后仍生效" : "仅进程内生效：落盘失败（检查 " + ENTRY_PROBE_TOKEN_FILE + ".url 的写权限）",
     });
   }
+  // ── 入口可达性上报（玩家自救，Issue #11）────────────────────────
+  // 场景：服务器登记的入口（公网 IP / 域名）在后端网络里连不上 —— 玩家打开的这个地址却是通的。
+  // 这时「登记的入口」对这名玩家等于死路，得让它就地用当前地址开玩。
+  // ⚠ 只在「已有可信来源登记的入口」时接受修正（不能从无到有地建立入口）：
+  //    否则「请求方自报的地址」又变成入口，就是之前被修掉的钓鱼漏洞（PR #7 评审 🔴1）。
+  //    另外这条上报只影响**入口**，不改变任何鉴权/权限。
+  if (urlPath === "/entry/localtip") {
+    const json = (code, obj) => {
+      res.writeHead(code, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+      res.end(JSON.stringify(obj));
+    };
+    const existing = normalizeOrigin(CURRENT_ORIGIN);
+    if (!existing) return json(409, { ok: false, applied: false, reason: "尚无登记入口，不接受可达性上报（避免把请求方自报的地址当入口）" });
+    let tip = "";
+    try {
+      const q = new URL(req.url || "/", "http://x").searchParams;
+      tip = originScope((q.get("origin") || "").trim(), { allowPrivateIp: true }).ok
+        ? originScope((q.get("origin") || "").trim(), { allowPrivateIp: true }).origin
+        : "";
+    } catch { tip = ""; }
+    if (!tip) return json(400, { ok: false, applied: false, reason: "origin 不是可用的 http(s) 地址" });
+    if (tip === existing) return json(200, { ok: true, applied: false, current: existing, reason: "与当前入口一致" });
+    const applied = recordEntry(tip, "localtip", { allowPrivateIp: true });
+    if (!applied) return json(400, { ok: false, applied: false, current: existing, reason: entryRejectReason(tip) });
+    // 修正也要落盘，否则下一次刷新会被旧的落盘值顶回去（玩家会看到"修了又变回来"）
+    const persisted = writeRegisteredEntryOrigin(applied);
+    console.log(`[入口] 按客户端可达性修正: ${existing} → ${applied}（登记入口在该玩家网络里连不上；persisted=${persisted}）`);
+    return json(200, { ok: true, applied: true, persisted, previous: existing, current: applied, source: "localtip（客户端可达性修正）" });
+  }
+
   // 健康检查（供 Docker HEALTHCHECK / 云负载均衡 / 你自己 curl 用）
   // 与 "/" 的区别：这里只证明**服务进程活着**，不关心 dist 是否构建，返回极小的 JSON。
   if (urlPath === "/healthz") {
@@ -173,8 +292,17 @@ const httpServer = http.createServer((req, res) => {
   }
   // 版本标识：好友/你一眼确认「这是游戏服务」而不是某个 IDE 或跳转页
   if (urlPath === "/__whoami") {
+    // 带上 sid + 当前入口：页面加载后据此判断「我打开的这个地址是不是服务器自己的入口」——
+    // 反代/隧道把用户送到别的地址时，前端能自动纠正到正确入口（玩家不需要懂这些）。
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
-    res.end(JSON.stringify({ game: "坦克大战深度版", kind: "game-server", distBuilt: fs.existsSync(path.join(DIST_DIR, "index.html")), host: req.headers.host || null }));
+    res.end(JSON.stringify({
+      game: "坦克大战深度版", kind: "game-server",
+      distBuilt: fs.existsSync(path.join(DIST_DIR, "index.html")),
+      host: req.headers.host || null,
+      sid: SID,
+      current: normalizeOrigin(CURRENT_ORIGIN) || null,
+      entryPath: entryPath(SID),
+    }));
     return;
   }
   // ── 稳定入口自动匹配：/<sid>/join/<roomId> ──────────────────────
@@ -189,7 +317,7 @@ const httpServer = http.createServer((req, res) => {
       // ⚠ 绝不用请求 Host 兜底 —— 否则可被伪造 Host 把稳定链接 302 到攻击者域名（PR #7 评审 🔴1）。
       const target = trustedTarget();
       // 没有任何可信入口（既没登记、也没平台模板）→ 给可操作提示页，绝不回退到访问者的 127.0.0.1
-      if (!target) { sendEntryGone(res, SID, "no-entry"); return; }
+      if (!target) { sendEntryGone(res, SID, "no-entry", { viewerIsLocal }); return; }
       redirectTo(res, roomId ? `${target}/?room=${roomId}` : `${target}/`);
       return;
     }
@@ -207,7 +335,7 @@ const httpServer = http.createServer((req, res) => {
     takeEntryTrustSignal(req, "entry");
     if (mEntry[1] === SID) {
       const target = trustedTarget();
-      if (!target) sendEntryGone(res, SID, "no-entry");
+      if (!target) sendEntryGone(res, SID, "no-entry", { viewerIsLocal });
       else redirectTo(res, `${target}/`);
     }
     else {
@@ -336,7 +464,26 @@ function refreshCurrentOriginFromTrusted(why) {
   if (explicit) { recordEntry(explicit, "register", { allowPrivateIp: true }); return; }
   const preview = detectPreviewUrl(PORT);              // 已做「无残留占位符」校验的单一事实源
   if (preview) { recordEntry(preview, `${why}:preview`); return; }
-  if (CURRENT_ORIGIN) recordEntry(CURRENT_ORIGIN, `${why}:keep`);
+  if (CURRENT_ORIGIN) { recordEntry(CURRENT_ORIGIN, `${why}:keep`); return; }
+  // ④ 谁都没有（没有模板、也没人登记）→ 由服务器自己把本机对外入口找出来（玩家不必手动跑 curl）
+  autoRegisterTrigger(`${why}:auto`);
+}
+
+// 自动登记是异步的（要探测公网 IP），但「当前入口」的读取必须是同步的 —— 两者解耦：
+// 先按上面的同步优先级给出结论（可能暂时是"没有入口"），探测完再刷新一次，入口随即出现。
+const autoRegisterState = { running: false, done: false, hasRun: false };
+function autoRegisterTrigger(why) {
+  if (autoRegisterState.running || autoRegisterState.done) return;
+  if (process.env.TANK_AUTO_ENTRY === "0") return;
+  autoRegisterState.running = true;
+  autoRegisterLocalEntry()
+    .catch(() => { /* 探测失败就当没有：宁缺勿错 */ })
+    .finally(() => {
+      autoRegisterState.running = false;
+      autoRegisterState.done = true;
+      if (!normalizeOrigin(CURRENT_ORIGIN)) { entries.sweep(); return; }
+      console.log(`[入口] ${why} → 当前入口就绪: ${CURRENT_ORIGIN}`);
+    });
 }
 
 /**
@@ -465,10 +612,19 @@ function redirectTo(res, location) {
  *   reason = "gone"     → 链接里的 sid 已不再服务（环境被回收 / 服务器已重启）
  *   reason = "no-entry" → 这台服务器还活着，但**没有确立对外入口**（既没平台模板，也没人带令牌登记）
  */
-function sendEntryGone(res, sid, reason = "gone") {
+function sendEntryGone(res, sid, reason = "gone", opts = {}) {
   const safeSid = String(sid).replace(/[^0-9a-f]/gi, "");
+  // 访问者就在本机（或同一内网）时，「入口还没配好」不该变成拦路虎：
+  //   把「直接开玩」的按钮放到最上面并自动跳一次 —— 玩家就是来打游戏的，不是来配入口的。
+  const selfServe = opts.viewerIsLocal
+    ? `<h2 style="color:#8fff8f">服务器就在你身边 —— 直接开玩</h2>
+<p>你打开的这个地址就是本机服务，正在自动进入游戏（大厅 / 房间都可用）：</p>
+<p><a style="color:#4af;font-size:18px" href="/">▶ 点这里直接开始游戏</a></p>
+<p style="color:#888">（给远程好友的链接会在入口登记完成后自动可玩，无需你手动配置）</p>
+<hr style="border-color:#333">`
+    : "";
   const body = reason === "no-entry"
-    ? `<h2 style="color:#ffd700">这台服务器还没有对外入口</h2>
+    ? `${selfServe}<h2 style="color:#ffd700">这台服务器还没有对外入口</h2>
 <p>服务器本身是在跑的，但它没有「公网地址」可跳 —— 所以这条链接暂时打不开（这比给你一个错地址要安全）。</p>
 <p>让部署的人补一条**带令牌的登记**即可（IP 或域名二选一，登记后本页就会自动跳过去）：</p>
 <pre style="color:#4af">curl -H "X-Tank-Entry-Token: $(cat ${ENTRY_PROBE_TOKEN_FILE})" \
@@ -478,9 +634,11 @@ function sendEntryGone(res, sid, reason = "gone") {
 <p>链接里的服务器内部 id <b>${safeSid}</b> 已不再服务（环境被回收或服务器已重启）。</p>
 <p>请让房主重新分享一条链接 —— 新链接会自动匹配到新的临时地址，无需手动改 IP/域名。</p>
 <p style="color:#888">（本机仍在线的话：<a style="color:#4af" href="/">打开当前服务器</a>）</p>`;
+  const autoGo = opts.viewerIsLocal ? `<script>setTimeout(function(){location.replace("/");},1200);</script>` : "";
   sendHtml(res, 200, `<!DOCTYPE html><html lang="zh"><meta charset="utf-8">
 <title>坦克大战 · 入口暂时不可用</title><body style="background:#0a0a0a;color:#ddd;font-family:monospace;padding:32px;line-height:1.9">
 ${body}
+${autoGo}
 </body></html>`);
 }
 
@@ -949,7 +1107,7 @@ function leaveTable(conn, table) {
 // ③ KEEPALIVE 是可选的外层保活（云原生环境离线 10 分钟会被回收）：
 //    设 TANK_KEEPALIVE=1 后，服务器每 60s 对自己公网入口发一次 /healthz，让环境一直有心跳。
 setInterval(() => {
-  refreshCurrentOriginFromTrusted("server");   // 只按可信来源刷新（模板/落盘登记）；不快照请求 Host
+  refreshCurrentOriginFromTrusted("server");
   entries.sweep();
 }, ENTRY_SWEEP_MS).unref?.();
 
@@ -965,7 +1123,20 @@ process.on("unhandledRejection", (reason) => {
   console.error(`[unhandledRejection] 已捕获，服务继续运行: ${reason}`);
 });
 
-httpServer.listen(PORT, HOST, () => {
+/** Startup entry resolution: no template / no registration -> run auto-register once. */
+async function autoRegisterStartup() {
+  if (process.env.TANK_AUTO_ENTRY === "0") return;
+  if (readRegisteredEntryOrigin() || normalizeOrigin(CURRENT_ORIGIN) || detectPreviewUrl(PORT)) return;
+  if (autoRegisterState.running || autoRegisterState.hasRun) return;
+  autoRegisterState.hasRun = true;            // 只跑一次：启动 / 定时刷新 / 首个请求谁先到就谁跑
+  autoRegisterState.running = true;
+  try { await autoRegisterLocalEntry(); } finally {
+    autoRegisterState.running = false;
+    autoRegisterState.done = true;
+  }
+}
+
+httpServer.listen(PORT, HOST, async () => {
   const nets = os.networkInterfaces();
   const lanIps = [];
   for (const list of Object.values(nets)) {
@@ -991,6 +1162,9 @@ httpServer.listen(PORT, HOST, () => {
   }
   // 稳定入口：链接形状不变，域名/IP 变了由 302 自动匹配 —— 玩家永远只需要手里这一条链接
   refreshCurrentOriginFromTrusted("server");
+  // 启动阶段同步把入口确立下来：没有模板、也没人登记时，服务器自己查本机公网/局域网地址并登记，
+  // 于是「打开页面就能玩」在第一个请求之前就成立 —— 不再要求玩家先跑一条 curl（Issue #11）。
+  await autoRegisterStartup();
   console.log(`  ── 稳定入口（分享给好友的链接形状，换域名/换 IP 都不用改）──`);
   console.log(`  服务器内部 id: ${SID}（同一进程内恒定；环境重建/重启后自动换新并自动匹配）`);
   console.log(`  稳定链接:      <当前入口>${entryPath(SID)}        ← 例如 ${CURRENT_ORIGIN || "http://<你的地址>"}${entryPath(SID)}`);
