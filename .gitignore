@@ -9,6 +9,13 @@ dist/
 /tests/ProvenanceData/
 /tests/**/ProvenanceData/
 
+# e2e 真机实测的依赖与浏览器缓存（Chromium ~400MB，绝不入库）
+#   跑法见 scripts/e2e/run-verify.sh（自动 npm i puppeteer + 下载 Chromium 到 tests/e2e/）
+/tests/e2e/.chrome/
+/tests/e2e/node_modules/
+/tests/e2e/package.json
+/tests/e2e/package-lock.json
+
 # tunneling binaries & configs (may contain tokens) - never commit
 tools/
 *.exe
