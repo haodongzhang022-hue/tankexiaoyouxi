@@ -21,11 +21,31 @@ npm run net:tunnel -- --test   # 探测"是不是游戏服务" + 实测延迟
 ## 方案 A · 本地/局域网机器 + Docker（最快得到固定入口）
 
 ```bash
+# 推荐用一键脚本：构建 → 启动 → 健康检查 → **带令牌登记对外入口** 一条龙
+bash deploy/start-server.sh 3001
+```
+
+> **玩家视角（Issue #11）：入口不再需要任何手动前置。**
+> 服务器启动时自己找一次对外入口（平台模板 → `TANK_PUBLIC_ENTRY` → 本机公网 IP → 局域网 IP）
+> 并落盘，容器一起来就能玩；下面那条 `curl` 登记只是**可选**的（用来指定公网 IP 或自有域名，
+> 让异地好友优先走你指定的地址）。要固定指定就传 `-e TANK_PUBLIC_ENTRY=http://<域名或IP>:3001`，
+> 同样零手动步骤。完全不想要自动登记（只认显式令牌登记）就 `-e TANK_AUTO_ENTRY=0`。
+
+等价的手工步骤（登记是**可选**的，跑不跑都能玩）：
+
+```bash
 docker build -f deploy/Dockerfile -t tank-online .   # 前端在镜像里构建，宿主无需 npm run build
-docker run -d --name tank -p 3001:3001 --restart=always tank-online
+mkdir -p "$PWD/.tank-deploy"
+docker run -d --name tank -p 3001:3001 --restart=always \
+  -e TANK_ENTRY_TOKEN_FILE=/data/entry.token -v "$PWD/.tank-deploy:/data" tank-online
+# （可选）显式登记「对外入口」——指定优先用哪个地址（IP 形态也认）：
+#   不跑这条也没关系：服务器启动时会自动登记本机公网/局域网 IP。
+curl -H "X-Tank-Entry-Token: $(cat .tank-deploy/entry.token)" \
+  "http://127.0.0.1:3001/entry/register?url=http://203.0.113.9:3001"
 ```
 
 - 局域网内：`http://<本机IP>:3001` 直接可玩，**零隧道、零延迟开销**；
+  **无域名也能分享**（v3.0.2）：登记 `http://192.168.1.50:3001` 即可，同 WiFi 好友点稳定链接会 302 到这台机器；
 - 要公网：路由器端口转发 3001（有公网IP时最佳，延迟最低），或在这台机器上跑
   一个 FRP/Cloudflare Tunnel 客户端（只需一条 TCP 转发，比 cpolar 自带的 HTTP 隧道稳）。
 
@@ -39,11 +59,13 @@ docker run -d --name tank -p 3001:3001 --restart=always tank-online
 scp -r . root@<服务器IP>:/opt/tank     # 或 git clone
 ssh root@<服务器IP>
 cd /opt/tank
-docker build -f deploy/Dockerfile -t tank-online .
-docker run -d --name tank -p 3001:3001 --restart=always tank-online
+bash deploy/start-server.sh 3001       # 构建 + 启动 + 健康检查 + 登记对外入口
 ```
 
 拿到固定入口 **`http://<服务器IP>:3001`**（绑域名后 `https://game.你的域名`，见下）。
+`start-server.sh` 会自动把公网 IP 登记成「当前入口」；换了 IP 或绑了域名，
+重跑一次脚本、或跑 `npm run net:tunnel -- --entry=http://<新IP或域名>:3001` 即可，
+分享出去的稳定链接不用改。
 
 延迟预期：机房→家的单向物理延迟通常在 10~40ms（同省更低），
 对比 cpolar 实测 600ms+，**有量级差异**。
@@ -86,8 +108,9 @@ server {
 
 证书：`certbot --nginx -d game.example.com`。
 
-游戏内「复制邀请链接」会自动学习当前域名（服务器动态识别 Host 头），
-换域名/换IP 都不用改代码。
+游戏内「复制邀请链接」用的是**服务器可信来源确立的入口**（带令牌的显式登记 / 平台预览模板），
+**不再采信请求里的 Host 头**（Host 可伪造，曾能把分享链接指向攻击者域名）。
+换域名/换 IP 后：跑一次登记（`npm run net:tunnel -- --entry=...`）或重启脚本即可，链接不用改。
 
 ## P2P 直连（进一步压低延迟）
 
@@ -125,4 +148,21 @@ docker inspect --format '{{.State.Health.Status}}' tank   # healthy
 curl -s http://127.0.0.1:3001/healthz                     # {"ok":true,...}
 ```
 
-一键脚本 `bash deploy/start-server.sh [端口]` 会把上面几步连起来跑（含健康检查等待）。
+一键脚本 `bash deploy/start-server.sh [端口]` 会把上面几步连起来跑：
+构建 → 启动（挂载 `.tank-deploy/` 存令牌与登记结果）→ 健康检查等待 → **带令牌登记对外入口** → 打印稳定链接。
+
+登记结果自检（`current` 应是你的公网 IP/域名，`currentSource` 说明它从哪来）：
+
+```bash
+curl -s http://127.0.0.1:3001/healthz   # {"current":"http://203.0.113.9:3001","currentSource":"register",...}
+```
+
+**入口从哪来（v3.0.3 起，优先级由高到低）**：
+1. 带令牌的**显式登记**（你说了算，不被别的来源顶回）；
+2. 平台注入的预览模板（云原生开发环境自带，已做残留占位符校验）；
+3. 服务器**自己找**的本机入口（`TANK_PUBLIC_ENTRY` → 本机公网 IP → 局域网 IP），并落盘 —— 零手动步骤。
+4. 玩家那侧如发现登记入口连不上（后端网络不通），会就地用「实际能连到的地址」开玩，
+   并允许修正一次（仅在**已有登记入口**时，避免请求方自报地址变成入口）。
+
+⚠ 上述全部拿不到时（完全离线/无网卡），稳定链接**不会**把好友送到 127.0.0.1，
+而是给一页可操作提示；本机/同一内网打开的访问者会在该页看到「直接开玩」并自动进游戏。
