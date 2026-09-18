@@ -1,6 +1,6 @@
 // main.ts
 import { GameLoop } from "./engine/GameLoop";
-import { Renderer } from "./engine/Renderer";
+import { Renderer, logicalCanvasSize } from "./engine/Renderer";
 import { InputManager, type PlayerInput } from "./engine/InputManager";
 import { getSoundManager } from "./engine/SoundManager";
 import { GamepadAdapter } from "./input/GamepadAdapter";
@@ -9,6 +9,7 @@ import { EndlessMode } from "./modes/EndlessMode";
 import { StageMode } from "./modes/StageMode";
 import { DpsTestMode } from "./modes/DpsTestMode";
 import { OnlineHostMode } from "./modes/OnlineHostMode";
+import { parseInviteRoom, buildInviteUrl as buildInviteUrlPure, buildLobbyUrl as buildLobbyUrlPure } from "./net/InviteLink";
 import { NetClient } from "./net/NetClient";
 import { RtcPeer, ICE_SERVERS } from "./net/RtcPeer";
 import type { ServerCandidate } from "./net/NetClient";
@@ -344,11 +345,15 @@ function describeServer(): string {
   return `${wsProto()}://${sharedHost || location.hostname}:3001`;
 }
 
-// ── 邀请链接：URL 形如 ?server=ws://...&room=<桌ID>，对方打开后自动进房 ──
-let autoJoinRoom: number | null = (() => {
-  const r = Number(new URLSearchParams(location.search).get("room"));
-  return Number.isFinite(r) && r > 0 ? r : null;
-})();
+// ── 邀请链接 ──────────────────────────────────────────────────────────
+//  URL 形如：
+//    · 带房间号  https://<域名>/?room=<桌ID>（等价写法 ?r=<桌ID>、?table=<桌ID>）
+//                → 打开后自动进联机 + 坐到该房间的座位上（服务器已满/已开局会明确提示）
+//    · 不带房间号 https://<域名>/            → 打开进大厅，自己选桌/开房
+//  房间号 = 服务器桌号（与大厅列表里的桌 ID 一致，稳定不变），不是房间名文字。
+// 房间号解析/链接生成的纯逻辑在 src/net/InviteLink.ts（有单测锁行为，勿在本文件重写一份）。
+/** 待加入的邀请房间（连上服务器后消费一次）。null = 本次进大厅，不自动坐桌。 */
+let autoJoinRoom: number | null = parseInviteRoom(location.search);
 
 // ── v3.0 稳定入口自动学习：链接形如 /<sid>/join/<roomId>（302 后到达页面，路径仍可解析）──
 // 页面地址 / 当前域名 里只要带得出 sid，就记下来 —— 之后无论是断线重连、刷新、
@@ -456,47 +461,74 @@ function getSharedOrigin(): string {
 }
 
 /**
- * 生成当前房间的邀请链接。
- * 关键规则：链接里绝不能出现 localhost / 127.0.0.1 —— 那在好友设备上指向他自己。
- *  - 页面本身通过非 localhost 地址打开（局域网 IP / 隧道域名）→ 同源即最佳；
- *  - 本机用 localhost 打开 → 用服务器在 welcome 中报告的真实局域网 IP 替换。
+ * 邀请链接**基址**（协议 + 主机 + 路径；拼房号一律交给 InviteLink 纯逻辑，本文件不手写字符串）。
+ *
+ * v2.39 合并 main：**先走 main 的稳定入口优先链**，再叠加本 PR 的 InviteLink 房号绑定：
+ *   ⓿ 稳定入口路径 `/<sid>/join/<roomId>` —— 域名/IP 变了由服务器 302 自动匹配，链接不用改；
+ *      （这是 Issue #11 的成果，合并时**必须保留**：房号在路径里，roomInPath=true）
+ *   ① 服务器可信来源确立的**完整 origin**（协议+端口都保留）——IP 形态不会被硬拼成 https；
+ *   ② 服务器汇报的入口 host（仅作 ① 缺席时的兜底）；
+ *   ③ 手动配置/自动记忆的公网入口（协议原样，IP 形态同样不打成 https）；
+ *   ④ 页面自身地址 / 局域网地址兜底（localhost 打开时用服务器报告的局域网 IP）。
+ *
+ * @param roomId 目标桌号（null = 大厅链接：稳定入口形态下即 `/<sid>/join/`，好友进大厅）
+ * @returns base=基址；extra=额外入口参数（如 server=…）；roomInPath=房号已在 base 路径里（调用方勿再拼 ?room=）
  */
-function buildInviteUrl(roomId: number): string {
-  // ⓿ v3.0 稳定入口：链接形状 = <当前域名>/<sid>/join/<roomId>。
-  //    域名用「当前实际域名」（**服务器可信来源确立的入口域名** > 页面自身域名），sid 恒定；
-  //    好友打开这条链接时由服务器 302 自动匹配到最新可用地址 → 域名变了链接也不用改。
-  //    ⚠ v3.0.1：服务器不再**学习**进站 Host（Host 可伪造，会被劫持成钓鱼链接），
-  //      所以这里的域名只可能是「服务器可信入口」或「页面自己所在的域名」——两者都不是 caller 自报。
+function shareBase(roomId: number | null): { base: string; extra: string; roomInPath: boolean } {
+  const noRoom = { extra: "", roomInPath: false } as const;
+  // ⓿ 稳定入口：链接形状 = <当前实际域名>/<sid>/join/<roomId>。
+  //    域名用「服务器可信来源确立的入口」> 页面自身域名（都不是 caller 自报，防 Host 伪造劫持）。
   const entryPath = stableEntryPath(roomId);
   if (entryPath) {
     const origin = getSharedOrigin();
-    if (origin) return `${origin}${entryPath}`;
+    if (origin) return { base: `${origin}${entryPath}`, extra: "", roomInPath: true };
     // 本机打开（localhost）：退回服务器的局域网 IP，同样带稳定入口路径（仅同 WiFi 可用）
     const lan = serverLanIps[0] || sharedHost;
-    if (lan) return `http://${lan}:${location.port || 3001}${entryPath}`;
+    if (lan) return { base: `http://${lan}:${location.port || 3001}${entryPath}`, extra: "", roomInPath: true };
   }
   // ① 服务器可信来源确立的当前入口（域名/IP 都算，客户端由 welcome/pong 自动刷新）
-  if (serverPublicOrigin) return `${serverPublicOrigin}/?room=${roomId}`;
-  if (serverPublicHost) return `https://${serverPublicHost}/?room=${roomId}`;
+  if (serverPublicOrigin) return { base: `${serverPublicOrigin.replace(/\/+$/, "")}/`, ...noRoom };
+  if (serverPublicHost) return { base: `https://${serverPublicHost.replace(/\/+$/, "")}/`, ...noRoom };
   // ② 手动配置/记忆的公网入口（兜底）：协议按用户/自动学习时给的原样，IP 形态不会被打成 https
   const pub = getPublicOrigin();
-  if (pub) return `${pub}/?room=${roomId}`;
+  if (pub) return { base: `${pub.replace(/\/+$/, "")}/`, ...noRoom };
 
   const h = location.hostname;
   const isLocal = !h || h === "localhost" || h === "127.0.0.1";
-  if (!isLocal) return `${location.origin}${location.pathname}?room=${roomId}`;
+  if (!isLocal) return { base: `${location.origin}${location.pathname}`, ...noRoom };
 
   // 开发模式（Vite 等非 3001 页面）：额外携带 ?server= 指向联机服
   if (location.port && location.port !== "3001") {
     const host = serverLanIps[0] || sharedHost;
-    if (!host) return "";
+    if (!host) return { base: "", ...noRoom };
     const server = encodeURIComponent(`${wsProto()}://${host}:3001`);
-    return `http://${host}:3001${location.pathname}?room=${roomId}&server=${server}`;
+    return { base: `http://${host}:3001${location.pathname}`, extra: `server=${server}`, roomInPath: false };
   }
   // 单端口部署 + localhost 打开：替换为服务器的局域网地址（仅同 WiFi 可用）
   const host = serverLanIps[0];
-  if (host) return `http://${host}:${location.port || 3001}${location.pathname}?room=${roomId}`;
-  return ""; // 拿不到任何可分享地址（无局域网网卡），由调用方提示
+  if (host) return { base: `http://${host}:${location.port || 3001}${location.pathname}`, ...noRoom };
+  return { base: "", ...noRoom }; // 拿不到任何可分享地址（无局域网网卡），由调用方提示
+}
+
+/** 生成「带房间号」邀请链接（好友打开后自动坐到本桌座位上；纯逻辑拼接见 InviteLink.buildInviteUrl）。 */
+function buildInviteUrl(roomId: number): string {
+  const { base, extra, roomInPath } = shareBase(roomId);
+  if (!base) return "";
+  // 稳定入口形态：房号已在路径 /<sid>/join/<roomId> 里，不再拼 ?room=（保持 Issue #11 的链接形状）
+  if (roomInPath) return base;
+  return buildInviteUrlPure(base, roomId, extra);
+}
+
+
+/**
+ * 不带房间号的「大厅链接」：好友打开后进大厅，自己选桌/开房（不占座位）。
+ * v2.38：**直接由入口地址构造**（不再绕道 buildInviteUrl(0) 再 strip —— 那依赖
+ * "room=0 非法"这条未声明的隐式契约，且会先生成一条非法房号链接）。
+ */
+function buildLobbyUrl(): string {
+  const { base, extra } = shareBase(null);
+  if (!base) return "";
+  return buildLobbyUrlPure(base, extra);
 }
 
 /** 复制文本到剪贴板（兼容非 https 环境：降级为临时 textarea / prompt） */
@@ -523,7 +555,7 @@ function copyText(t: string): void {
 }
 
 // ── 大厅鼠标/触屏按钮：canvas 命中检测（每帧渲染时注册，点击时倒序命中）──
-interface LobbyButton { x: number; y: number; w: number; h: number; onTap: () => void; }
+interface LobbyButton { x: number; y: number; w: number; h: number; label?: string; onTap: () => void; }
 let lobbyButtons: LobbyButton[] = [];
 
 function drawLobbyButton(x: number, y: number, w: number, h: number, label: string,
@@ -532,7 +564,7 @@ function drawLobbyButton(x: number, y: number, w: number, h: number, label: stri
   renderer.strokeRect(x, y, w, h, border, 2);
   renderer.drawText(label, x + w / 2, y + (h - 14) / 2 + 2,
     { font: "13px monospace", color: fg, align: "center" });
-  lobbyButtons.push({ x, y, w, h, onTap });
+  lobbyButtons.push({ x, y, w, h, label, onTap });
 }
 
 /** 判断当前是否处于可暂停的游戏对局中 */
@@ -576,11 +608,28 @@ function registerPauseMenuButtons(W: number, H: number): void {
   });
 }
 
+/** 大厅（state==="online" 且未入桌）里命中房间列表视口？→ 返回列表几何，否则 null */
+function lobbyListHit(x: number, y: number): { geo: ReturnType<typeof lobbyListGeom> } | null {
+  // 仅"模式已选 + 未入桌"的房间大厅页才有列表（模式选择页 / 桌内都没有）
+  if (state !== "online" || onlineInTable || onlineMode === null) return null;
+  const geo = lobbyListGeom(currentLayout.canvasW, currentLayout.canvasH);
+  if (x < 16 || x > 16 + geo.listW) return null;
+  if (y < geo.top || y > geo.bottom) return null;
+  return { geo };
+}
+
 canvas.addEventListener("pointerdown", (e) => {
   const r = canvas.getBoundingClientRect();
   if (!r.width || !r.height) return;
   const x = (e.clientX - r.left) * (currentLayout.canvasW / r.width);
   const y = (e.clientY - r.top) * (currentLayout.canvasH / r.height);
+  // v2.38 大厅房间列表：按下**不立即进桌**，先记手势 —— 拖动 = 滚动列表，抬手未拖动 = 进桌。
+  //       （必须延迟到抬手结算，否则"想滚动"会先在按下瞬间把房间点进去）
+  if (lobbyListHit(x, y)) {
+    const row = lobbyRowAt(y);
+    lobbyDrag = { startY: y, startScroll: lobbyScroll, moved: false, row };
+    if (row) return;   // 列表行由 pointerup 结算，不走下面的即时命中
+  }
   // 联机成员：点击转发给远端视图（升级面板点选等），暂停时不转发；对局结束后改走结束菜单按钮
   const overOnline = (state === "online_host" && !!host?.isOver) || (state === "online_client" && !!remoteView?.isOver());
   if (state === "online_client" && remoteView && !paused && !overOnline) {
@@ -625,6 +674,39 @@ window.addEventListener("pointermove", (e) => {
   const p = onlineDragXY(e);
   if (p) remoteView.dragPointerMove(p.x, p.y);
 });
+window.addEventListener("pointerup", () => { lobbyDrag = null; });   // 指针移出画布也要清手势
+canvas.addEventListener("pointermove", (e) => {
+  if (!lobbyDrag) return;
+  const r = canvas.getBoundingClientRect();
+  if (!r.width || !r.height) return;
+  const y = (e.clientY - r.top) * (currentLayout.canvasH / r.height);
+  const dy = y - lobbyDrag.startY;
+  if (Math.abs(dy) > 6) lobbyDrag.moved = true;
+  const rows = Math.round(dy / LOBBY_ROW_STEP);
+  if (rows !== 0) {
+    const maxScroll = Math.max(0, lobbyScrollMaxRows());
+    lobbyScroll = Math.max(0, Math.min(lobbyDrag.startScroll - rows, maxScroll));
+  }
+});
+// v2.38 列表行"抬手结算"：未拖动（位移 ≤6px）→ 进该桌；拖动过 → 只当滚动，不进桌
+canvas.addEventListener("pointerup", () => {
+  const d = lobbyDrag;
+  lobbyDrag = null;
+  if (!d || !d.row || d.moved) return;
+  getSoundManager().play("pickup");
+  onlineJoin(d.row);
+});
+// 滚轮滚动房间列表（桌面端）
+canvas.addEventListener("wheel", (e) => {
+  if (state !== "online" || onlineInTable) return;
+  const r = canvas.getBoundingClientRect();
+  if (!r.width || !r.height) return;
+  const x = (e.clientX - r.left) * (currentLayout.canvasW / r.width);
+  const y = (e.clientY - r.top) * (currentLayout.canvasH / r.height);
+  if (!lobbyListHit(x, y)) return;
+  e.preventDefault();
+  lobbyScroll = Math.max(0, Math.min(lobbyScroll + (e.deltaY > 0 ? 1 : -1), lobbyScrollMaxRows()));
+}, { passive: false });
 window.addEventListener("pointerup", (e) => {
   if (state !== "online_client" || !remoteView || paused) return;
   const p = onlineDragXY(e);
@@ -699,6 +781,7 @@ function onlineToggleReady(): void {
 }
 function onlineStartGame(): void { net.start(); }
 function onlineLeaveTable(): void { net.leave(); }
+/** 复制当前房间的邀请链接（带房间号 → 好友打开直接坐进本桌座位） */
 function onlineCopyInvite(): void {
   if (!onlineCurrent) return;
   const url = buildInviteUrl(onlineCurrent.id);
@@ -707,7 +790,17 @@ function onlineCopyInvite(): void {
     return;
   }
   copyText(url);
-  notifyOnline(`已复制: ${url.length > 52 ? url.slice(0, 52) + "…" : url}`);
+  notifyOnline(`已复制邀请链接（含房间号 #${onlineCurrent.id}）: ${url.length > 52 ? url.slice(0, 52) + "…" : url}`);
+}
+/** 复制「大厅链接」（不带房间号 → 好友打开只进大厅，不占座位、不会莫名坐到别人桌上） */
+function onlineCopyLobbyLink(): void {
+  const url = buildLobbyUrl();
+  if (!url || url.includes("//localhost") || url.includes("//127.0.0.1")) {
+    notifyOnline("无法生成分享链接：未获取到本机局域网地址，请改用 http://<你的IP>:3001 打开页面");
+    return;
+  }
+  copyText(url);
+  notifyOnline(`已复制大厅链接（不带房间号，好友打开进大厅）: ${url.length > 52 ? url.slice(0, 52) + "…" : url}`);
 }
 
 // 应用设置：操作模式/音量/方向
@@ -764,6 +857,18 @@ function startGame(mode: number): void {
 // ── 联机流程 ──
 function notifyOnline(msg: string): void { onlineMsg = msg; onlineMsgTimer = 2.5; }
 
+/**
+ * 与 notifyOnline 相同，但**不盖掉**还没过期的更具体提示。
+ * v2.39 合并集成：main 的「入口自救」（ensureLocalPlayableEntry，welcome 后 1.4s）会给一句
+ * 「连不上登记的入口，已就地开玩」——这是**本机视角的自愈说明**；若它盖掉 1.4s 内刚出的
+ * 邀请链接失败原因（已满 / 已不存在 / 本局进行中），玩家就看不到「为什么没进去」。
+ * 故仅在消息位空闲时才提示（有更具体提示在显示 → 让位）。
+ */
+function notifyOnlineIfQuiet(msg: string): void {
+  if (onlineMsgTimer > 0) return;
+  notifyOnline(msg);
+}
+
 function enterOnline(): void {
   cancelOnlineReconnect();    // v2.25 手动进入：清掉待执行的重连
   tablesSynced = false;
@@ -773,6 +878,7 @@ function enterOnline(): void {
   onlineMsg = "";
   onlineMode = null;          // 先选模式
   onlineModeSel = 0;
+  lobbyScroll = 0;
   onlineInTable = false;
   onlineCurrent = null;
   onlineSel = 0;
@@ -802,6 +908,45 @@ function returnToOnlineLobby(): void {
   onlineSel = 0;
   state = "online";
   notifyOnline("已返回大厅，重新选桌或新建房间");
+}
+
+/** 邀请链接自动进房的重试状态：只对「本局进行中」重试（等本局结束）；其余错误一次定性。 */
+let inviteJoinTries = 0;
+const INVITE_JOIN_MAX_TRIES = 10;          // 10 次 × 3s = 30s：够等一局短局打完
+const INVITE_JOIN_RETRY_MS = 3000;
+let inviteRetryTimer: number | null = null;
+
+/** 放弃自动进房：清待加入状态 + 停重试定时器（统一出口，避免漏清） */
+function stopInviteJoin(): void {
+  autoJoinRoom = null;
+  if (inviteRetryTimer !== null) { clearTimeout(inviteRetryTimer); inviteRetryTimer = null; }
+}
+
+/** 带房间号的邀请链接：连上服务器后坐到该桌（重试中每次会说明第几次尝试）。 */
+function tryJoinInviteRoom(roomId: number): void {
+  if (state !== "online" || onlineInTable || !net.connected) return;
+  inviteJoinTries += 1;
+  notifyOnline(inviteJoinTries === 1
+    ? `正在加入邀请房间 #${roomId}…`
+    : `邀请房间 #${roomId} 本局进行中，等本局结束…（第 ${inviteJoinTries} 次尝试）`);
+  net.join(roomId);
+}
+
+/** 安排下一次自动进房重试（仅在仍停留在该邀请链接的进房流程中时生效） */
+function scheduleInviteJoinRetry(): void {
+  if (autoJoinRoom === null || onlineInTable) return;
+  const roomId = autoJoinRoom;
+  if (inviteJoinTries >= INVITE_JOIN_MAX_TRIES) {
+    // v2.38 文案按**真实原因**分档：房号是对的，只是这一局还没打完
+    stopInviteJoin();
+    notifyOnline(`邀请的房间 #${roomId} 本局仍在进行中，已停在大厅：等本局结束后重新点开邀请链接即可，也可先选别的桌`);
+    return;
+  }
+  if (inviteRetryTimer !== null) return;
+  inviteRetryTimer = window.setTimeout(() => {
+    inviteRetryTimer = null;
+    if (autoJoinRoom !== null) tryJoinInviteRoom(autoJoinRoom);
+  }, INVITE_JOIN_RETRY_MS);
 }
 
 /**
@@ -869,7 +1014,7 @@ async function ensureLocalPlayableEntry(): Promise<void> {
     } catch { reachable = false; }
     if (reachable) return;                                       // 入口可达：保持现状，不必自救
     console.log(`[稳定入口] 登记的入口 ${target} 从本机连不上 → 就地使用当前地址 ${origin}`);
-    notifyOnline("当前网络连不上服务器登记的入口，已就地用你打开的这个地址开玩");
+    notifyOnlineIfQuiet("当前网络连不上服务器登记的入口，已就地用你打开的这个地址开玩");
   }
   // ① 本地稳定入口 = 当前实际可用的地址（玩家刷新/断线重连走它）
   entryMgr.save({ sid, roomId: onlineCurrent?.id ?? autoJoinRoom ?? entryMgr.peek()?.roomId ?? null, url: origin });
@@ -914,10 +1059,15 @@ function wireNetHandlers(): void {
       notifyOnline("检测到中断的对局，正在重连…");
       setTimeout(() => net.rejoin(rej.tableId, rej.token), 300);
     } else if (autoJoinRoom !== null && !onlineInTable) {
-      const r = autoJoinRoom;
-      autoJoinRoom = null;
-      notifyOnline(`正在加入邀请房间…`);
-      net.join(r);
+      // 带房间号邀请链接 → 自动坐进该桌。
+      // v2.38 修复：**不在这里写死 onlineMode**（旧版写死 "endless"，会把闯关桌的邀请
+      // 强行显示成无尽：进桌后标题/列表全按无尽渲染，离桌后大厅只剩无尽桌）。
+      // 模式由 net.on("table") 用 table.mode 反推（见下方 handler），房号未知时保持 null。
+      inviteJoinTries = 0;
+      tryJoinInviteRoom(autoJoinRoom);
+    } else if (autoJoinRoom === null && !onlineInTable) {
+      // 不带房间号（大厅链接 / 直接打开）→ 留在大厅自己选桌
+      inviteJoinTries = 0;
     }
   });
   net.on("table", (table) => {
@@ -925,6 +1075,8 @@ function wireNetHandlers(): void {
     onlineInTable = table.seats.some((s) => s && s.clientId === net.myClientId);
     // 邀请链接自动进房时，从桌信息反推模式（跳过模式选择）
     if (onlineInTable && onlineMode === null) onlineMode = table.mode;
+    // 已成功坐进邀请房间（或已在别的桌内）→ 清掉待加入状态，停止重试
+    if (onlineInTable) stopInviteJoin();
     // 进入房间时重置人机队友数量和座位状态
     if (onlineInTable) { roomBotCount = 0; seatStates = ["open", "open", "open", "open"]; }
   });
@@ -943,7 +1095,12 @@ function wireNetHandlers(): void {
       scheduleOnlineReconnect();
     }
   });
-  net.on("left", () => { onlineInTable = false; onlineCurrent = null; onlineSel = 0; roomBotCount = 0; seatStates = ["open", "open", "open", "open"]; clearRejoinCard(); notifyOnline("已离开房间"); });
+  net.on("left", () => {
+    onlineInTable = false; onlineCurrent = null; onlineSel = 0; roomBotCount = 0;
+    seatStates = ["open", "open", "open", "open"]; clearRejoinCard();
+    stopInviteJoin();   // 主动离桌 = 放弃邀请链接的自动进房，留在大厅
+    notifyOnline("已离开房间");
+  });
   net.on("start", (start) => beginOnlineGame(start));
   net.on("rejoin_ok", (d) => {      // v2.11 局内重进成功：直接恢复对局（复用 beginOnlineGame）
     (window as any).__rejoinApplied = true;   // e2e 判定"已重连回对局"
@@ -953,7 +1110,25 @@ function wireNetHandlers(): void {
   net.on("error", (msg) => {        // v2.11 重连令牌失效（对局已结束/座位被顶替/房主迁移）→ 清卡回大厅
     if (peekRejoinCard()) { clearRejoinCard(); notifyOnline(`重连失败：${msg}，已回大厅`); }
     // v2.25 大厅内连接失败（服务器未启动/重启中）→ 自动重试，不把玩家丢回主菜单
-    if (state === "online" && !net.connected) scheduleOnlineReconnect();
+    if (state === "online" && !net.connected) { scheduleOnlineReconnect(); return; }
+    // 邀请链接自动进房：可恢复的错误（房间列表尚未同步/座位刚被释放）→ 重试；
+    // 不可恢复（房间不存在 = 邀请链接已失效、房间已满）→ 停止重试并说清原因
+    if (autoJoinRoom !== null && !onlineInTable && state === "online") {
+      const roomId = autoJoinRoom;
+      if (msg.includes("已满")) {
+        stopInviteJoin();
+        notifyOnline(`邀请的房间 #${roomId} 已满，已停在大厅：请选别的桌或等一位空位（座位释放后重新点开邀请链接即可）`);
+      } else if (msg.includes("不存在")) {
+        stopInviteJoin();
+        notifyOnline(`邀请链接里的房间 #${roomId} 已不存在，已停在大厅：请向好友要新链接，或自行选桌/开房`);
+      } else if (msg.includes("对局中")) {
+        scheduleInviteJoinRetry();   // 本局进行中 → 等本局结束再试（唯一会重试的情形）
+      } else {
+        // v2.38：未知错误不再空转重试（旧版对任何错误都重试 12s），按真实原因报出来
+        stopInviteJoin();
+        notifyOnline(`邀请房间 #${roomId} 加入失败（${msg}），已停在大厅：请自行选桌/开房`);
+      }
+    }
   });
   net.on("peerInput", (msg) => { if (host && msg.idx === 1) { host.enqueueRemoteInput(msg.flags, msg.clientFrame ?? 0, msg.clientSendTime ?? Date.now()); host.lastPeerInputTime = msg.clientSendTime ?? Date.now(); } });
   net.on("peerLeft", () => { });
@@ -1079,7 +1254,7 @@ function handleOnline(dt: number): void {
 
   if (input.wasJustPressed("Escape")) {
     if (onlineInTable) { net.leave(); }
-    else if (onlineMode !== null) { onlineMode = null; onlineSel = 0; }
+    else if (onlineMode !== null) { onlineMode = null; onlineSel = 0; lobbyScroll = 0; }
     else { net.disconnect(); state = "menu"; }
     return;
   }
@@ -1096,6 +1271,7 @@ function handleOnline(dt: number): void {
     if (input.wasJustPressed("Enter") || input.wasJustPressed("Space") || input.wasJustPressed("KeyQ")) {
       onlineMode = onlineModeSel === 0 ? "endless" : "stage";
       onlineSel = 0;
+      lobbyScroll = 0;
       getSoundManager().play("pickup");
     }
     return;
@@ -1136,6 +1312,70 @@ function handleOnline(dt: number): void {
   }
 }
 
+// ── v2.38 大厅房间列表几何（单一事实源：渲染 / 点击命中 / 滚动共用，防三处漂移）──
+//   列表列 x = 16 .. listW；行 y = top + i*step（行高 rowH）；视口止于主按钮行上方 10px。
+//   底部辅助按钮（房间方向 / 复制大厅链接）放在**列表右侧独立列**（横向不相交）；
+//   窄屏放不下时退化为「列表视口上移 + 按钮居中在按钮行之上」。
+const LOBBY_ROW_H = 36;
+const LOBBY_ROW_STEP = 40;
+const LOBBY_LIST_TOP = 136;
+function lobbyListGeom(W: number, H: number) {
+  const listW = Math.max(300, Math.floor(W * 0.5));
+  const colX = Math.min(W - 20, 16 + listW + 24);   // 右侧独立列（同桌内面板 x）
+  const colW = W - colX - 16;
+  const sideCol = colW >= 140;                  // 右列放得下辅助按钮？
+  const auxRowY = H - 138;                      // 辅助按钮行（h26 → 止于 H-112）
+  // 视口底：宽屏辅助按钮在右列 → 只需避开主按钮行（H-104）；窄屏辅助按钮居中 → 还要避开它（H-138）
+  const bottom = sideCol ? H - 114 : auxRowY - 10;
+  // 行数 = 能完整放下的行（末行底 ≤ bottom）
+  const maxRows = Math.max(1, Math.floor((bottom - LOBBY_LIST_TOP - LOBBY_ROW_H) / LOBBY_ROW_STEP) + 1);
+  return { listW, top: LOBBY_LIST_TOP, bottom, maxRows, rowH: LOBBY_ROW_H, step: LOBBY_ROW_STEP, colX, colW, sideCol, auxRowY };
+}
+/**
+ * 大厅列表：给定画布 y → 命中的桌（未命中任何可视行则 null）。
+ * 与 renderOnline 用同一套几何（lobbyListGeom + lobbyScroll），避免"画在哪 / 点在哪"两处漂移。
+ */
+function lobbyRowAt(y: number): NetTable | null {
+  const geo = lobbyListGeom(currentLayout.canvasW, currentLayout.canvasH);
+  if (y < geo.top || y > geo.bottom) return null;
+  const idx = Math.floor((y - geo.top) / geo.step);
+  const rowTop = geo.top + idx * geo.step;
+  if (y > rowTop + geo.rowH) return null;             // 行间空隙（step - rowH = 4px）不算命中
+  const filtered = onlineTables.filter((t) => t.mode === onlineMode);
+  const t = filtered[lobbyScroll + idx];
+  return t ?? null;
+}
+/** 大厅房间列表滚动位置（首个可见行下标）；滚轮/触屏拖拽/键盘选中都会调整它 */
+let lobbyScroll = 0;
+/** 本帧实际渲染并注册了点击的房间行（e2e 断言"列表过滤/滚动真的生效"用；随帧重建） */
+let lobbyVisibleRows: Array<{ id: number; mode: string; y: number; h: number }> = [];
+/** 上一帧的选中行下标：用于区分"键盘移动选中"（列表跟随）与"手动滚动"（不回拽） */
+let lastLobbySel = 0;
+/** 当前模式房间列表的最大可滚动行数（渲染/手势共用，避免两处各算一遍） */
+function lobbyScrollMaxRows(): number {
+  const geo = lobbyListGeom(currentLayout.canvasW, currentLayout.canvasH);
+  const n = onlineTables.filter((t) => t.mode === onlineMode).length;
+  return Math.max(0, n - geo.maxRows);
+}
+/** 列表内的指针手势：轻点 = 进桌（抬手时结算），拖拽 = 滚动（滚动时取消进桌） */
+let lobbyDrag: { startY: number; startScroll: number; moved: boolean; row: NetTable | null } | null = null;
+
+// ── v2.38 桌内底部区布局（自底向上分层，单一事实源；面板高度与绘制共用，防两处漂移）──
+//   准备/开始/离开 H-58 (h28) → 分享按钮 H-94 (h28) → 房间方向 H-128 (h26) → URL H-138 → 标题 H-154
+function onlineTableBottomLayout(H: number): {
+  mainRowY: number; mainRowH: number; shareRowY: number; shareRowH: number;
+  orientRowY: number; orientRowH: number; urlTextY: number; titleTextY: number; blockTop: number;
+} {
+  const mainRowY = H - 58, mainRowH = 28;
+  const shareRowY = mainRowY - 8 - 28;
+  const shareRowH = 28;
+  const orientRowY = shareRowY - 8 - 26;
+  const orientRowH = 26;
+  const urlTextY = orientRowY - 10;
+  const titleTextY = urlTextY - 16;
+  return { mainRowY, mainRowH, shareRowY, shareRowH, orientRowY, orientRowH, urlTextY, titleTextY, blockTop: titleTextY - 12 };
+}
+
 function renderOnline(W: number, H: number): void {
   const now = performance.now();
   // 美化背景
@@ -1171,6 +1411,7 @@ function renderOnline(W: number, H: number): void {
       lobbyButtons.push({ x: bx, y: by, w: bw, h: 48, onTap: () => {
         onlineMode = i === 0 ? "endless" : "stage";
         onlineSel = 0;
+        lobbyScroll = 0;
         getSoundManager().play("pickup");
       }});
     });
@@ -1209,15 +1450,40 @@ function renderOnline(W: number, H: number): void {
 
   // 该模式房间列表（左侧）
   const filtered = onlineTables.filter((t) => t.mode === onlineMode);
+  // v2.38 🔴2 修复：房间列表**有明确视口**（止于主按钮行上方 10px），行矩形绝不与按钮相交；
+  //       超出视口的房间用滚动（滚轮 / 触屏拖拽 / ↑↓ 键盘）访问，手机端同样可达。
+  const geo = lobbyListGeom(W, H);
+  lobbyVisibleRows = [];
+  const ROW_H = geo.rowH, ROW_STEP = geo.step, LIST_TOP = geo.top, listBottom = geo.bottom;
+  const maxRows = geo.maxRows;
+  if (onlineSel >= filtered.length) onlineSel = Math.max(0, filtered.length - 1);
+  // 滚动窗口（v2.38）：
+  //   ① 键盘改了选中项 → 让选中行进入视口（跟随滚动）；
+  //   ② 用户手动滚动（滚轮/拖拽）时**不**回拽 —— 若选中行被滚出视口，把选中项拉到最近的可见行，
+  //      保证 Enter/点击语义一致（否则旧逻辑每帧都会把手动滚动复位，滚不动）。
+  const maxScroll = Math.max(0, filtered.length - maxRows);
+  lobbyScroll = Math.max(0, Math.min(lobbyScroll, maxScroll));
+  if (onlineSel !== lastLobbySel) {
+    if (onlineSel < lobbyScroll) lobbyScroll = onlineSel;
+    else if (onlineSel >= lobbyScroll + maxRows) lobbyScroll = onlineSel - maxRows + 1;
+    lastLobbySel = onlineSel;
+  } else if (onlineSel < lobbyScroll || onlineSel >= lobbyScroll + maxRows) {
+    onlineSel = Math.min(filtered.length - 1, Math.max(lobbyScroll, Math.min(onlineSel, lobbyScroll + maxRows - 1)));
+    lastLobbySel = onlineSel;
+  }
+  const firstIdx = lobbyScroll;
+  const visible = filtered.slice(firstIdx, firstIdx + maxRows);
   let ly = 118;
   renderer.ctx.save();
   renderer.ctx.font = "bold 13px monospace";
   renderer.ctx.fillStyle = "#4a9eff";
   renderer.ctx.textAlign = "left";
-  renderer.ctx.fillText(`房间列表（${filtered.length} 桌）:`, 20, ly);
+  const rangeTxt = filtered.length > maxRows ? `（${firstIdx + 1}-${firstIdx + visible.length} / ${filtered.length} 桌，↑↓ 滚动）` : "";
+  renderer.ctx.fillText(`房间列表（${filtered.length} 桌）${rangeTxt}:`, 20, ly);
   renderer.ctx.restore();
   ly += 18;
-  const listW = Math.max(300, Math.floor(W * 0.5));
+  // v2.39 🟡2 收口：列表宽用 lobbyListGeom 的单一事实源（渲染/命中/滚动同源），不再本处重算一遍
+  const listW = geo.listW;
   if (filtered.length === 0) {
     renderer.ctx.save();
     renderer.ctx.font = "13px monospace";
@@ -1225,8 +1491,8 @@ function renderOnline(W: number, H: number): void {
     renderer.ctx.fillText("正在准备房间列表…（点底部「＋ 新建房间」可直接开房，不会无房可加）", 20, ly);
     renderer.ctx.restore();
   }
-  filtered.forEach((t, i) => {
-    const sel = i === onlineSel && !onlineInTable;
+  visible.forEach((t, i) => {
+    const sel = firstIdx + i === onlineSel && !onlineInTable;
     const seats = t.seats.filter((s) => s).length;
     const readyTxt = t.seats.filter((s) => s && s.ready).length;
     const empty = seats === 0;
@@ -1236,7 +1502,7 @@ function renderOnline(W: number, H: number): void {
     } else {
       renderer.ctx.fillStyle = "rgba(14,18,32,0.7)";
     }
-    renderer.ctx.fillRect(16, ly, listW, 36);
+    renderer.ctx.fillRect(16, ly, listW, ROW_H);
     if (sel) {
       renderer.ctx.strokeStyle = "#ffd700";
       renderer.ctx.lineWidth = 1.5;
@@ -1266,16 +1532,35 @@ function renderOnline(W: number, H: number): void {
     renderer.ctx.fillStyle = stateColor;
     renderer.ctx.fillText(`座位 ${seats}/4  准备 ${readyTxt}/4  ${t.state === "playing" ? "对局中" : empty ? "空桌" : "等待中"}`, 26, ly + 27);
     renderer.ctx.restore();
-    if (!onlineInTable) lobbyButtons.push({ x: 16, y: ly, w: listW, h: 36, onTap: () => onlineJoin(t) });
-    ly += 40;
+    // v2.38 房间行**不再注册为 lobbyButtons**：点击由列表手势统一结算（pointerdown 记手势 →
+    //   pointerup 未拖动则 onlineJoin）。这样"房间行"与"按钮"两套命中区彻底分离，不可能互相抢占；
+    //   这里只登记本帧可视行（供 e2e/调试断言"列表过滤与滚动真的生效"）。
+    if (!onlineInTable && ly >= LIST_TOP && ly + ROW_H <= listBottom) {
+      lobbyVisibleRows.push({ id: t.id, mode: t.mode, y: ly, h: ROW_H });
+    }
+    ly += ROW_STEP;
   });
+  // 视口还有更多房间 → 底边画滚动提示（触屏可拖、滚轮可滚、键盘 ↑↓ 可滚）
+  if (filtered.length > maxRows) {
+    renderer.ctx.save();
+    renderer.ctx.font = "10px monospace";
+    renderer.ctx.fillStyle = "#6b83a8";
+    renderer.ctx.textAlign = "left";
+    renderer.ctx.fillText(
+      `↕ 滚轮/拖动/↑↓ 滚动（共 ${filtered.length} 桌，当前 ${firstIdx + 1}-${firstIdx + visible.length}）`,
+      20, listBottom + 4);
+    renderer.ctx.restore();
+  }
 
   // 当前座位（右侧：麻将桌风格）
   if (onlineInTable && onlineCurrent) {
     const px = Math.min(W - 20, 16 + listW + 24);
     const py = 118;
     const panelW = W - px - 16;
-    const panelH = Math.max(280, H - 200);
+    // v2.38 面板底让出底部邀请区（标题/URL + 两行按钮），面板内提示行不再与标题重叠
+    const panelH = Math.max(280, (onlineTableBottomLayout(H).blockTop - 10) - py);
+    // 面板内提示行位置：贴着邀请区上沿（比"面板底 -30"更稳，短面板也不会压标题）
+    const panelHintY = Math.min(py + panelH - 30, onlineTableBottomLayout(H).blockTop - 52);
 
     // 房间信息面板背景
     renderer.ctx.fillStyle = "rgba(10,14,28,0.85)";
@@ -1327,9 +1612,13 @@ function renderOnline(W: number, H: number): void {
 
     // ── 麻将桌：椭圆形桌子 + 4个方位座位 ──
     const tableCx = px + panelW / 2;
-    const tableCy = py + panelH / 2 + 30;  // v2.15 往下移，避免与顶部操作区重叠
+    // v2.38 桌子在「操作区下沿(py+80) .. 提示行上沿(panelHintY-10)」之间垂直居中，
+    //       纵向半径按可用高度收缩（座位标签 = tableCy+tableRy+58 不越界）
+    const tableUsableTop = py + 80;
+    const tableUsableBottom = panelHintY - 10;
+    const tableCy = (tableUsableTop + tableUsableBottom) / 2;
     const tableRx = Math.min(panelW * 0.38, 110);
-    const tableRy = Math.min(panelH * 0.25, 60);
+    const tableRy = Math.min(60, Math.max(30, (tableUsableBottom - tableUsableTop) / 2 - 62));
 
     // 桌子阴影
     renderer.ctx.fillStyle = "rgba(0,0,0,0.4)";
@@ -1534,20 +1823,28 @@ function renderOnline(W: number, H: number): void {
     });
 
     // 操作提示（底部）
-    const hintY = py + panelH - 30;
+    const hintY = panelHintY;
     renderer.ctx.save();
     renderer.ctx.font = "10px monospace";
     renderer.ctx.fillStyle = "#ffaa00";
     renderer.ctx.textAlign = "center";
     renderer.ctx.fillText(onlineIsHost() ? "点「开始」开局（其他人需已准备）" : "点「准备」后等待房主开始", px + panelW / 2, hintY);
     renderer.ctx.fillStyle = "#4a9eff";
-    renderer.ctx.fillText("Y 复制邀请链接 / U 设置公网入口（域名或 IP:端口） / T 房间方向（房主）", px + panelW / 2, hintY + 14);
+
+    renderer.ctx.fillText("Y 复制邀请链接（含房间号） / U 设置公网入口（域名或 IP:端口） / T 房间方向（房主）", px + panelW / 2, hintY + 14);
+    renderer.ctx.fillStyle = "#7cff7c";
+    renderer.ctx.fillText(`本桌房间号 #${onlineCurrent.id}（邀请链接带此号 = 好友直接坐进来）`, px + panelW / 2, hintY + 28);
     renderer.ctx.restore();
   }
 
   // ── 底部：桌内 = 邀请分享 + 准备/开始/离开按钮；大厅 = 开桌/改名按钮 + 键位说明 ──
   if (onlineInTable && onlineCurrent) {
-    // 邀请链接预览
+    // v2.38 桌内底部区**自底向上分层**（各层矩形互不相交，标题/URL 不再被按钮压住）：
+    //   准备/开始/离开  H-58 (h28) → 分享按钮 H-94 (h28) → 房间方向 H-128 (h26) → URL H-138 → 标题 H-154
+    const { mainRowY, mainRowH, shareRowY, shareRowH, orientRowY, orientRowH, urlTextY, titleTextY } =
+      onlineTableBottomLayout(H);
+
+    // 邀请链接预览（标题 + URL：都在按钮之上，无遮挡）
     const url = buildInviteUrl(onlineCurrent.id);
     const maxChars = Math.max(24, Math.floor(W / 7.2));
     const shown = url
@@ -1559,27 +1856,35 @@ function renderOnline(W: number, H: number): void {
     renderer.ctx.fillStyle = isPub ? "#8fff8f" : "#ffaa00";
     renderer.ctx.textAlign = "center";
     renderer.ctx.fillText(isPub
-      ? "邀请链接 · 稳定入口（换域名/换 IP 自动匹配，远程好友可访问）："
-      : "邀请链接 · 稳定入口·局域网（仅同 WiFi；服务器有公网入口后自动切换）：",
-      W / 2, H - 134);
+      ? `邀请链接 · 稳定入口 · 房间号 #${onlineCurrent.id}（换域名/换 IP 自动匹配，好友打开直接坐进本桌）：`
+      : `邀请链接 · 稳定入口 · 房间号 #${onlineCurrent.id} · 局域网（仅同 WiFi；服务器有公网入口后自动切换）：`,
+      W / 2, titleTextY);
     renderer.ctx.fillStyle = "#66ccff";
-    renderer.ctx.fillText(shown, W / 2, H - 118);
+    renderer.ctx.fillText(shown, W / 2, urlTextY);
     renderer.ctx.restore();
 
     // v2.36 房间方向（房主可实时更改并广播；成员只读显示，进入对局时双方按此对齐）
     {
       const curOrient = (onlineCurrent.orient ?? "landscape") === "portrait" ? "竖屏 📱" : "横屏 🖥";
       if (onlineIsHost()) {
-        drawLobbyButton(W / 2 - 140, H - 170, 280, 26, `房间方向：${curOrient}（T 键更改）`,
+        drawLobbyButton(W / 2 - 140, orientRowY, 280, orientRowH, `房间方向：${curOrient}（T 键更改）`,
           "#1a1020", "#a6f", "#c9f", onlineToggleOrient);
       } else {
-        drawLobbyButton(W / 2 - 140, H - 170, 280, 26, `房间方向：${curOrient}（由房主设定）`,
+        drawLobbyButton(W / 2 - 140, orientRowY, 280, orientRowH, `房间方向：${curOrient}（由房主设定）`,
           "#14141c", "#555", "#999", () => {});
       }
     }
 
-    drawLobbyButton(W / 2 - 140, H - 100, 280, 30, "📋 复制邀请链接 · 发给好友",
-      "#102033", "#4af", "#9df", onlineCopyInvite);
+    // 两种分享入口（同一行并排）：带房间号（好友直接坐进来）/ 不带房间号（好友进大厅自己选桌）
+    {
+      const shareW = Math.min(280, Math.floor((W - 40 - 8) / 2));
+      const shareGap = 8;
+      const shareX = W / 2 - (shareW * 2 + shareGap) / 2;
+      drawLobbyButton(shareX, shareRowY, shareW, shareRowH, `📋 复制邀请链接 · 房间 #${onlineCurrent.id}`,
+        "#102033", "#4af", "#9df", onlineCopyInvite);
+      drawLobbyButton(shareX + shareW + shareGap, shareRowY, shareW, shareRowH, "🏠 复制大厅链接（不带房间号）",
+        "#141c2b", "#5a6a8a", "#9ab", onlineCopyLobbyLink);
+    }
 
     // 准备 / 开始 / 离开
     const mySeatNow = onlineCurrent.seats.find((s) => s && s.clientId === net.myClientId);
@@ -1588,16 +1893,16 @@ function renderOnline(W: number, H: number): void {
     const btnW = Math.min(150, Math.floor((W - 40) / 3) - 8);
     const gap = 8;
     const bx = W / 2 - (btnW * 3 + gap * 2) / 2;
-    drawLobbyButton(bx, H - 58, btnW, 28, myReadyNow ? "取消准备" : "✅ 准备",
+    drawLobbyButton(bx, mainRowY, btnW, mainRowH, myReadyNow ? "取消准备" : "✅ 准备",
       "#12210f", "#4f4", "#cfc", onlineToggleReady);
     if (isHost) {
-      drawLobbyButton(bx + btnW + gap, H - 58, btnW, 28, "▶ 开始游戏 (S)",
+      drawLobbyButton(bx + btnW + gap, mainRowY, btnW, mainRowH, "▶ 开始游戏 (S)",
         "#221a05", "#fd0", "#ffd75e", onlineStartGame);
     } else {
-      drawLobbyButton(bx + btnW + gap, H - 58, btnW, 28, "等待房主开始…",
+      drawLobbyButton(bx + btnW + gap, mainRowY, btnW, mainRowH, "等待房主开始…",
         "#181818", "#333", "#777", () => {});
     }
-    drawLobbyButton(bx + (btnW + gap) * 2, H - 58, btnW, 28, "← 离开房间",
+    drawLobbyButton(bx + (btnW + gap) * 2, mainRowY, btnW, mainRowH, "← 离开房间",
       "#21100f", "#f66", "#faa", onlineLeaveTable);
   } else {
     // v2.25 四按钮响应式排布（竖屏 480 宽也不出屏）：返回 / 快速加入（自动开房）/ 新建房间 / 改名
@@ -1605,7 +1910,20 @@ function renderOnline(W: number, H: number): void {
     const obGap = 8;
     const obX = W / 2 - (obW * 4 + obGap * 3) / 2;
     // v2.35 房间方向切换（横屏/竖屏）：建房时写入房间，成员端自动对齐
-    drawLobbyButton(W / 2 - 140, H - 140, 280, 26, `房间方向：${menuOrient === 1 ? "竖屏 📱" : "横屏 🖥"}（T 键切换）`, "#1a1020", "#a6f", "#c9f", onlineToggleOrient);
+    // v2.38 🔴2：辅助按钮放**列表右侧独立列**（与房间行横向不相交，不再抢点击）；
+    //   窄屏（右列宽度 < 140）退化为居中放在主按钮行之上，同时列表视口上移到其上。
+    if (geo.sideCol) {
+      const auxW = Math.min(260, geo.colW);
+      const auxX = geo.colX;
+      drawLobbyButton(auxX, geo.top, auxW, 26, `房间方向：${menuOrient === 1 ? "竖屏 📱" : "横屏 🖥"}（T 键切换）`, "#1a1020", "#a6f", "#c9f", onlineToggleOrient);
+      drawLobbyButton(auxX, geo.top + 34, auxW, 26, "🏠 复制大厅链接（不带房间号）", "#141c2b", "#5a6a8a", "#9ab", onlineCopyLobbyLink);
+    } else {
+      // 窄屏（竖屏 480）：两个辅助按钮并排居中，整行都在列表视口底（H-148）之下 → 不压房间行
+      const auxW = Math.min(180, Math.floor((W - 40 - 8) / 2));
+      const auxX = W / 2 - (auxW * 2 + 8) / 2;
+      drawLobbyButton(auxX, geo.auxRowY, auxW, 26, `房间方向：${menuOrient === 1 ? "竖屏 📱" : "横屏 🖥"}（T）`, "#1a1020", "#a6f", "#c9f", onlineToggleOrient);
+      drawLobbyButton(auxX + auxW + 8, geo.auxRowY, auxW, 26, "🏠 复制大厅链接", "#141c2b", "#5a6a8a", "#9ab", onlineCopyLobbyLink);
+    }
     drawLobbyButton(obX, H - 104, obW, 30, "← 主菜单", "#2a1a1a", "#f66", "#faa", exitOnlineToMenu);
     drawLobbyButton(obX + (obW + obGap), H - 104, obW, 30, "⚡ 快速加入/开房 (C)", "#0f1f14", "#4af", "#9df", onlineQuickJoin);
     drawLobbyButton(obX + (obW + obGap) * 2, H - 104, obW, 30, "＋ 新建房间 (B)", "#102a1a", "#4f8", "#afd", onlineCreateTable);
@@ -1613,6 +1931,7 @@ function renderOnline(W: number, H: number): void {
 
     drawHintBar(renderer.ctx, W, H, [
       "↑/↓ 选桌   Enter/点击 加入   C 快速加入（没房会自动开一桌）   B 新建房间   T 房间方向   N 改名   Esc 返回模式选择",
+      "邀请：进房后点「复制邀请链接」= 带房间号，好友打开直接坐进本桌；「复制大厅链接」= 好友只进大厅",
       "座位 1~2 = 战斗玩家（P1 主机 / P2 成员）· 座位 3~4 = 观战成员；人机队友需房主在房间内手动添加",
     ]);
   }
@@ -2039,6 +2358,19 @@ wireNetHandlers();
 if (new URLSearchParams(location.search).has("debug")) {
   (window as any).__tankDebug = {
     inviteUrl: () => (state === "online" && onlineCurrent ? buildInviteUrl(onlineCurrent.id) : null),
+    lobbyUrl: () => buildLobbyUrl(),
+    room: () => onlineCurrent?.id ?? null,
+    pendingInviteRoom: () => autoJoinRoom,
+    // ── v2.38 布局/命中面（e2e 断言"按钮不压房间行 / 标题不被遮挡"用）──
+    buttons: () => lobbyButtons.map((b) => ({ x: b.x, y: b.y, w: b.w, h: b.h, label: b.label ?? "" })),
+    lobbyGeom: () => lobbyListGeom(currentLayout.canvasW, currentLayout.canvasH),
+    visibleRoomRows: () => lobbyVisibleRows.map((r) => ({ ...r })),
+    tableBottomLayout: () => onlineTableBottomLayout(currentLayout.canvasH),
+    canvasSize: () => ({ w: currentLayout.canvasW, h: currentLayout.canvasH }),
+    scrollLobby: (n: number) => { lobbyScroll = n; },
+    /** e2e：把选中行设到指定下标（配合 scrollLobby 做确定性键盘滚动断言） */
+    selectRoomRow: (n: number) => { onlineSel = Math.max(0, n); lastLobbySel = onlineSel; },
+    notif: () => onlineMsg,
     serverLanIps: () => serverLanIps,
     state: () => ({ state, mode: onlineMode, inTable: onlineInTable, netConnected: net.connected }),
     key: (code: string) => {
@@ -2046,11 +2378,30 @@ if (new URLSearchParams(location.search).has("debug")) {
       document.dispatchEvent(new KeyboardEvent("keyup", { code }));
     },
     click: (cx: number, cy: number) => {
+      // 完整一次点击：pointerdown + pointerup（列表行在手势抬手时结算，只按下不算点击）
+      // 坐标换算与真实 pointerdown 同一口径：逻辑坐标 → CSS（用逻辑尺寸，不用物理缓冲尺寸，
+      // 否则高 DPI 设备 dpr=2 时会差一倍）
       const c = canvas;
       const r = c.getBoundingClientRect();
-      const x = r.left + cx * (r.width / c.width);
-      const y = r.top + cy * (r.height / c.height);
+      const { w: lw, h: lh } = logicalCanvasSize(c);
+      const x = r.left + cx * (r.width / lw);
+      const y = r.top + cy * (r.height / lh);
       c.dispatchEvent(new PointerEvent("pointerdown", { clientX: x, clientY: y, bubbles: true }));
+      c.dispatchEvent(new PointerEvent("pointerup", { clientX: x, clientY: y, bubbles: true }));
+    },
+    /** e2e：列表拖拽滚动（按下 → 若干次 move → 抬手；抬手不触发进桌） */
+    drag: (cx: number, cy0: number, cy1: number) => {
+      const c = canvas;
+      const r = c.getBoundingClientRect();
+      const { w: lw, h: lh } = logicalCanvasSize(c);
+      const X = r.left + cx * (r.width / lw);
+      const Y = (cy: number) => r.top + cy * (r.height / lh);
+      c.dispatchEvent(new PointerEvent("pointerdown", { clientX: X, clientY: Y(cy0), bubbles: true }));
+      const steps = 6;
+      for (let i = 1; i <= steps; i++) {
+        c.dispatchEvent(new PointerEvent("pointermove", { clientX: X, clientY: Y(cy0 + (cy1 - cy0) * i / steps), bubbles: true }));
+      }
+      c.dispatchEvent(new PointerEvent("pointerup", { clientX: X, clientY: Y(cy1), bubbles: true }));
     },
     rawState: () => ({ menuSel }),
     getEndlessMode: () => endless,
@@ -2061,7 +2412,8 @@ if (new URLSearchParams(location.search).has("debug")) {
     getNetClient: () => net,
   };
 }
-// 带邀请链接 ?room=<ID> 打开：自动进入联机并加入该房间
+// 带房间号的邀请链接（?room=<桌ID> / ?r= / ?table=）→ 直接进联机并坐到该桌；
+// 不带房间号（或房间号非法，如 ?room=abc）→ 照常进主菜单，玩家自己进大厅选桌。
 if (autoJoinRoom !== null) {
   state = "online";
   onlineMsg = "";
