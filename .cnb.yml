@@ -45,6 +45,13 @@
 #     连前面的 pkill 都不跑，stage 秒失败（143ms / code 2）。
 #     → 本文件所有阶段脚本统一用**块标量 `script: |`**（项间无 `&&` 拼接），
 #       且后台启动一律包进子 shell `( ... & )`，任何拼接语义下都不会出现尾随裸 `&`。
+#     ⚠ 反例（曾写进 Issue #3 的「修正示例」里，**照抄必挂，已实测失败**）：
+#         script: |
+#           nohup node server/index.mjs > /tmp/tank-server.log 2>&1 &
+#           sleep 2
+#       块标量下每行都是独立命令，`&` 只把 nohup 放后台并**立即**执行下一行；
+#       父 shell 退出时子进程收到 SIGHUP/SIGTERM → `code 143`，且日志里后续输出全丢。
+#       必须写成子 shell：`( nohup ... > log 2>&1 & echo $! > pid )`。
 #
 #   坑 2｜`pkill -f "<脚本里出现过的字符串>"` 会**杀掉自己**
 #     平台把整段脚本作为 `sh -c "<脚本文本>"` 执行，该 shell 的**命令行里就含脚本文本**；
