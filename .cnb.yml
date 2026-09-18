@@ -23,11 +23,14 @@
 #   - 本文件必须在**目标分支自身**存在，否则该分支的「云原生开发」起不来；
 #   - 【稳定链接 v3.0】服务器启动后会打印「稳定链接」`<当前域名>/<sid>/join/<房间号>`：
 #     域名/IP 变了由服务器 302 自动匹配，链接不用改；同一进程内 sid 恒定，重启/环境重建才换新。
-#     自测：npm run net:entry-test（10/10）
-#   - 【入口只信可信来源 v3.0.1】「当前入口」**不采信进站请求的 Host**（Host 可伪造，会被劫持成钓鱼链接）。
-#     只认：平台预览模板域名 / 带一次性令牌的探针（GET /entry/register?url=<域名>，
-#     令牌在 $TANK_ENTRY_TOKEN_FILE，默认 /tmp/tank-entry-<port>.token，0600）/ 已确立的可信入口。
-#     换域名后跑一次 `npm run net:tunnel`（已内置带令牌登记）即可让稳定链接自动跟上新域名。
+#     自测：npm run net:entry-test（16/16；已接入门禁 —— vscode 与 issue 两条流水线都跑）
+#   - 【入口只信可信来源 v3.0.2】「当前入口」**不采信进站请求的 Host**（Host 可伪造，会被劫持成钓鱼链接）。
+#     优先级：① 带一次性令牌的**显式登记**（GET /entry/register?url=<IP 或域名>，令牌在
+#     $TANK_ENTRY_TOKEN_FILE，默认 /tmp/tank-entry-<port>.token，0600；登记结果落盘 .url，重启后仍在）
+#     → ② 平台预览模板（经同口径校验，含残留占位符一律作废）→ ③ 保持现有入口。
+#     **IP 形态部署（无域名）同样可登记**：http://203.0.113.9:3001 / http://192.168.1.50:3001 都能当入口；
+#     没有任何入口时给可操作提示页，**绝不**把好友 302 到 127.0.0.1（那会指向他自己机器）。
+#     换域名/换 IP 后跑一次 `npm run net:tunnel -- --entry=http://<新地址>:3001` 即可（deploy/start-server.sh 已内置）。
 #   - 这里的 stages 只装依赖/构建/起服务/自测，不要占用 3001，避免与服务器抢端口。
 #
 # ⚠⚠ 阶段脚本两个「真机踩过」的坑（改本文件前必读，勿回退）：
@@ -62,6 +65,11 @@ $:
           script: npm ci
         - name: build-dist
           script: npm run build
+        - name: stable-entry-regression
+          # 稳定入口回归锁（PR #8 评审 🟡2：不进门禁的锁必腐）。
+          # 真起服务器 + 真发 HTTP，覆盖：IP 形态登记 → 302 到该 IP、伪造 Host 不得改写入口、
+          # 模板残留占位符不得成为入口、显式登记优先级、令牌 0600 + 不跟随符号链接。
+          script: npm run net:entry-test
         - name: start-tank-server
           # 块标量单条脚本：无 `&&` 拼接、后台启动在子 shell 里、不 pkill 自匹配。
           script: |
@@ -119,6 +127,9 @@ issue.comment@npc:
         script: npm ci
       - name: build-dist
         script: npm run build
+      - name: stable-entry-regression
+        # 稳定入口回归锁：纯 node --test（自起服务器、自选随机端口，不占用 3001）
+        script: npm run net:entry-test
       - name: start-server-and-selfcheck
         script: |
           set -u

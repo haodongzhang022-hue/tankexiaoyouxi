@@ -167,7 +167,11 @@ function stableEntryPath(roomId: number | null): string | null {
   if (!sid) return null;
   return entryPathOf(sid, roomId);
 }
-/** 稳定链接候选：优先同源（当前域名已被 302 到正确环境），其次服务器汇报的当前入口地址 */
+/**
+ * 稳定链接候选：优先同源（当前域名已被 302 到正确环境），其次服务器汇报的当前入口地址。
+ * ⚠ 之前这里用 `shared === entryUrl` 比「ws://…」与「https://…」，恒不成立（死分支）；
+ *   现在只比 host（协议归一后再比），语义清楚：手里的域名与服务器入口不同才多跳一次。
+ */
 function stableEntryCandidates(): string | null {
   const room = onlineCurrent?.id ?? autoJoinRoom ?? null;
   const path = stableEntryPath(room ?? null);
@@ -175,12 +179,8 @@ function stableEntryCandidates(): string | null {
   const wsUrl = (origin: string) => `${origin.replace(/^http/i, "ws").replace(/\/+$/, "")}${path}`;
   const sameOrigin = `${wsProto()}://${location.host}${path}`;
   const entryUrl = net.entryUrl;
-  if (entryUrl && entryUrl !== location.origin) {
-    // 当前域名变了（或手里链接是旧域名）→ 先试服务器汇报的最新入口
-    const latest = wsUrl(entryUrl);
-    const shared = sharedHost ? `${wsProto()}://${sharedHost}` : null;
-    return shared && shared === entryUrl ? sameOrigin : latest;
-  }
+  const here = `${wsProto()}://${location.host}`;
+  if (entryUrl && entryUrl.replace(/^http/i, "ws").replace(/\/+$/, "") !== here) return wsUrl(entryUrl);
   return sameOrigin;
 }
 /** 服务器汇报新 sid/入口 → 自动滚动更新本地稳定链接（同一进程内 sid 不变，无需重新分享） */
@@ -195,13 +195,19 @@ function onEntryReport(sid: string, url: string | null): void {
   } else if (url) {
     entryMgr.adopt(sid, url, onlineCurrent?.id ?? autoJoinRoom ?? null);
   }
-  if (serverPublicHost && prev?.sid === sid) keepStableEntryForHost(serverPublicHost);
+  if (serverPublicOrigin && prev?.sid === sid) keepStableEntryForOrigin(serverPublicOrigin);
 }
-/** 公网域名变化（服务器动态学习到新隧道域名）→ 稳定链接自动挂到新域名上 */
-function keepStableEntryForHost(host: string): void {
+/**
+ * 服务器入口变化 → 稳定链接自动挂到新入口上。
+ * v3.0.2：接受**完整 origin**（http://203.0.113.9:3001 / https://game.example.com），
+ * 不再硬拼 `https://` —— IP 形态部署（无域名）也要能分享出可用链接（PR #8 评审 🔴2）。
+ */
+function keepStableEntryForOrigin(origin: string | null): void {
   const card = entryMgr.peek();
-  if (!card) return;
-  entryMgr.save({ ...card, url: `https://${host}${entryPathOf(card.sid, card.roomId ?? null)}` });
+  if (!card || !origin) return;
+  const clean = origin.trim().replace(/\/+$/, "");
+  if (!/^https?:\/\//i.test(clean)) return;
+  entryMgr.save({ ...card, url: `${clean}${entryPathOf(card.sid, card.roomId ?? null)}` });
 }
 function saveRejoinCard(tableId: number, token: string): void { rejoinMgr.save({ tableId, token }); }
 function peekRejoinCard(): { tableId: number; token: string } | null { return rejoinMgr.peek(); }
@@ -233,8 +239,10 @@ function tryStartP2P(start: { myIndex: number; players: Array<{ clientId: number
   } catch { return null; }
 }
 let serverLanIps: string[] = [];   // 服务器在 welcome 里报告的本机局域网 IP（生成邀请链接用）
-// 服务器**可信来源**确立的当前入口域名（v3.0.1：不再从进站 Host 学习，Host 可伪造）
+// 服务器**可信来源**确立的当前入口（v3.0.1：不再从进站 Host 学习，Host 可伪造）
+// v3.0.2：host 与**完整 origin** 都留一份 —— 域名形态用 https，IP 形态必须带协议+端口
 let serverPublicHost: string | null = null;
+let serverPublicOrigin: string | null = null;
 let onlineName = localStorage.getItem("tank_online_name") || "玩家";
 let onlineTables: NetTable[] = [];
 // v2.25 是否已收到过服务器桌子列表：未同步前不自动建房（避免连接时序空窗误建重复房）
@@ -390,41 +398,55 @@ function getSharedHost(): string {
   if (lan) { sharedHost = lan; sharedHostAt = Date.now(); return lan; }
   return h;
 }
-/** 公网隧道域名（localStorage 记忆；配置/自动学习均可设置） */
-function getPublicHost() {
+/** 手动配置/记忆的公网入口（localStorage；U 键可改）。原样保存，协议与端口都不丢。 */
+function getPublicOrigin(): string | null {
   try {
-    const v = localStorage.getItem("tank_public_host");
+    const v = (localStorage.getItem("tank_public_host") || "").trim();
     if (!v) return null;
-    return v.trim().replace(/^https?:\/\//, "").replace(/[\/].*$/, "").replace(/:\d+$/, "");
+    const clean = v.replace(/[\/]+$/, "");
+    if (/^https?:\/\//i.test(clean)) return clean;              // 用户/自动学习时带了协议 → 原样用
+    // 只有 host[:port]：域名默认 https，IP（含端口）默认 http —— 后者是 IP 形态部署的常见姿势
+    return `${/^\d+\.\d+\.\d+\.\d+/.test(clean) ? "http" : "https"}://${clean}`;
   } catch { return null; }
+}
+/** 手动配置/记忆的公网 host（展示用；保留端口） */
+function getPublicHost(): string | null {
+  const o = getPublicOrigin();
+  return o ? o.replace(/^https?:\/\//i, "") : null;
 }
 function setPublicHost(h: string | null) {
   try {
-    if (h) localStorage.setItem("tank_public_host", h.trim().replace(/^https?:\/\//, "").replace(/[\/].*$/, ""));
+    if (h) localStorage.setItem("tank_public_host", h.trim().replace(/[\/]+$/, ""));
     else localStorage.removeItem("tank_public_host");
   } catch {}
 }
-/** 页面通过公网隧道域名打开时自动记住（桌面端分享时也用它） */
+/**
+ * 页面通过**公网地址**打开时自动记住它（桌面端分享时也用它）。
+ * v3.0.2：公网 IP 形态也记（含端口），且把协议一起记住（http://203.0.113.9:3001 不能拼成 https）。
+ * 局域网 IP / 回环仍不记（好友设备上无意义）。
+ */
 function autoLearnPublicHost() {
   try {
     const h = location.hostname;
     if (!h || h === "localhost" || h === "127.0.0.1" || h === "0.0.0.0") return;
-    if (/^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h)) return; // 局域网不记
-    setPublicHost(h);
+    const isLan = /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h);
+    if (isLan) return;                                    // 局域网地址不记（只对同一 WiFi 有意义）
+    setPublicHost(`${location.protocol}//${location.host}`);
   } catch {}
 }
 
 
-/** 可分享的「当前域名 origin」：服务器自动学习的公网域名 > 页面自身域名（排除 localhost）；没有则 "" */
+/**
+ * 可分享的「当前入口 origin」：服务器可信来源确立的入口 > 页面自身域名（排除 localhost）；没有则 ""。
+ * v3.0.2：优先用服务器给的**完整 origin**（协议+端口都在里面），这样
+ *   域名（https://game.example.com）、公网 IP（http://203.0.113.9:3001）、
+ *   局域网 IP（http://192.168.1.50:3001）三种形态都能原样分享出去。
+ */
 function getSharedOrigin(): string {
-  if (serverPublicHost) {
-    const clean = serverPublicHost.trim().replace(/^https?:\/\//, "").replace(/[\/].*$/, "");
-    if (clean && !/^localhost|^127\./.test(clean)) return `https://${clean}`;
-  }
+  const pub = serverPublicOrigin || (serverPublicHost ? `https://${serverPublicHost}` : "");
+  if (pub && /^https?:\/\//i.test(pub) && !/^https?:\/\/(localhost|127\.)/i.test(pub)) return pub.replace(/\/+$/, "");
   const h = location.hostname;
   if (!h || h === "localhost" || h === "127.0.0.1" || h === "0.0.0.0") return "";
-  const isLan = /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h);
-  if (isLan && location.port === "3001") return `${location.protocol}//${h}:3001`;
   return location.origin;
 }
 
@@ -448,11 +470,12 @@ function buildInviteUrl(roomId: number): string {
     const lan = serverLanIps[0] || sharedHost;
     if (lan) return `http://${lan}:${location.port || 3001}${entryPath}`;
   }
-  // ① 服务器可信来源确立的当前入口域名（隧道/环境域名变了，客户端由 welcome/pong 自动刷新）
+  // ① 服务器可信来源确立的当前入口（域名/IP 都算，客户端由 welcome/pong 自动刷新）
+  if (serverPublicOrigin) return `${serverPublicOrigin}/?room=${roomId}`;
   if (serverPublicHost) return `https://${serverPublicHost}/?room=${roomId}`;
-  // ② 手动配置/记忆的公网域名（兜底）
-  const pub = getPublicHost();
-  if (pub) return `https://${pub}/?room=${roomId}`;
+  // ② 手动配置/记忆的公网入口（兜底）：协议按用户/自动学习时给的原样，IP 形态不会被打成 https
+  const pub = getPublicOrigin();
+  if (pub) return `${pub}/?room=${roomId}`;
 
   const h = location.hostname;
   const isLocal = !h || h === "localhost" || h === "127.0.0.1";
@@ -783,14 +806,16 @@ function wireNetHandlers(): void {
     onlineTables = tables;
     tablesSynced = true;   // v2.25 已同步：允许"快速加入/开房"直接决策
     // 服务器每次广播都带最新公网域名（来自可信来源）→ 邀请链接实时自动适配（稳定链接同步换域名）
-    if (net.publicHost) { serverPublicHost = net.publicHost; keepStableEntryForHost(net.publicHost); }
+    if (net.publicHost) serverPublicHost = net.publicHost;
+    if (net.publicOrigin) { serverPublicOrigin = net.publicOrigin; keepStableEntryForOrigin(net.publicOrigin); }
   });
   net.on("welcome", () => {
     // 记录服务器报告的真实局域网地址（生成邀请链接用）
     const si = net.serverInfo;
     if (si && si.lanIps.length) serverLanIps = si.lanIps;
-    // 服务器动态学习的公网隧道域名（隧道重启/域名变化时自动更新，无需手动配置）
-    if (net.publicHost) { serverPublicHost = net.publicHost; keepStableEntryForHost(net.publicHost); }
+    // 服务器可信来源确立的当前入口（隧道/换 IP 后由登记刷新，客户端自动跟上）
+    if (net.publicHost) serverPublicHost = net.publicHost;
+    if (net.publicOrigin) { serverPublicOrigin = net.publicOrigin; keepStableEntryForOrigin(net.publicOrigin); }
     // 页面经公网隧道打开 → 自动记住该域名（兜底：本地手动模式）
     autoLearnPublicHost();
     // v2.19 连接后主动拉取桌子列表（不依赖服务器广播时序，避免大厅空表）
@@ -1015,8 +1040,9 @@ function handleOnline(dt: number): void {
     if (input.wasJustPressed("KeyT") && onlineIsHost()) { onlineToggleOrient(); return; }
     if (input.wasJustPressed("KeyU") && onlineCurrent) {
       const cur = getPublicHost() ?? "";
-      const nn = prompt("设置公网隧道域名（如 27201307.r29.cpolar.top），留空清除：", cur);
-      if (nn !== null) { setPublicHost(nn.trim() || null); notifyOnline(nn.trim() ? "公网域名已设置，邀请链接将用公网地址" : "已清除公网域名"); }
+      // v3.0.2：公网 **IP（带端口）** 也能填 —— 无域名的部署形态靠它分享（如 203.0.113.9:3001）
+      const nn = prompt("设置公网入口（域名如 27201307.r29.cpolar.top，或 IP:端口如 203.0.113.9:3001），留空清除：", cur);
+      if (nn !== null) { setPublicHost(nn.trim() || null); notifyOnline(nn.trim() ? "公网入口已设置，邀请链接将用它" : "已清除公网入口"); }
       return;
     }
   }
@@ -1427,7 +1453,7 @@ function renderOnline(W: number, H: number): void {
     renderer.ctx.textAlign = "center";
     renderer.ctx.fillText(onlineIsHost() ? "点「开始」开局（其他人需已准备）" : "点「准备」后等待房主开始", px + panelW / 2, hintY);
     renderer.ctx.fillStyle = "#4a9eff";
-    renderer.ctx.fillText("Y 复制邀请链接 / U 设置公网域名 / T 房间方向（房主）", px + panelW / 2, hintY + 14);
+    renderer.ctx.fillText("Y 复制邀请链接 / U 设置公网入口（域名或 IP:端口） / T 房间方向（房主）", px + panelW / 2, hintY + 14);
     renderer.ctx.restore();
   }
 
@@ -1438,15 +1464,15 @@ function renderOnline(W: number, H: number): void {
     const maxChars = Math.max(24, Math.floor(W / 7.2));
     const shown = url
       ? (url.length > maxChars ? url.slice(0, maxChars) + "…" : url)
-      : "（未配置公网域名且无局域网地址，按 U 设置公网域名）";
-    const isPub = !!serverPublicHost || !!getPublicHost();
+      : "（未配置公网入口且无局域网地址，按 U 设置公网入口）";
+    const isPub = !!serverPublicOrigin || !!serverPublicHost || !!getPublicOrigin();
     renderer.ctx.save();
     renderer.ctx.font = "11px monospace";
     renderer.ctx.fillStyle = isPub ? "#8fff8f" : "#ffaa00";
     renderer.ctx.textAlign = "center";
     renderer.ctx.fillText(isPub
       ? "邀请链接 · 稳定入口（换域名/换 IP 自动匹配，远程好友可访问）："
-      : "邀请链接 · 稳定入口·局域网（仅同 WiFi；服务器学到公网域名后自动切换到公网）：",
+      : "邀请链接 · 稳定入口·局域网（仅同 WiFi；服务器有公网入口后自动切换）：",
       W / 2, H - 134);
     renderer.ctx.fillStyle = "#66ccff";
     renderer.ctx.fillText(shown, W / 2, H - 118);

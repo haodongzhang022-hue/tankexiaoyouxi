@@ -121,13 +121,16 @@ line();
 // 临时地址会变（环境重建换域名），但内部 id 恒定 → 链接不变；变了也由服务器 302 自动匹配。
 //
 // 【可信入口登记】服务器**不采信任何请求自报的 Host**（Host 可伪造，会把别人的分享链接指向攻击者域名）。
-// 所以公网入口只能由「能进容器/能读落盘令牌」的部署脚本登记：
+// 所以对外入口只能由「能进容器/能读落盘令牌」的部署脚本登记（**IP 形态同样有效**，v3.0.2）：
 //   ① 服务器启动时把一次性令牌写到 $TANK_ENTRY_TOKEN_FILE（默认 /tmp/tank-entry-<port>.token，0600）；
-//   ② 本脚本（部署者身份）读它 → 调 /entry/register?url=<公网域名> 显式登记当前入口；
-//   ③ 落盘一份到 <token file>.url，供无 HTTP 通路时的环境使用（服务器每次刷新都会读）。
-// 于是：换域名后跑一次 net:tunnel 就能把稳定链接自动指到新域名，且攻击者伪造 Host 完全无效。
+//   ② 本脚本（部署者身份）读它 → 调 /entry/register?url=<公网 IP 或域名> 显式登记当前入口；
+//      服务器会把它落盘到 <token file>.url，并在每次刷新时**优先**采用（不会被平台模板顶回）。
+//   ③ 也可显式指定：`--entry=http://1.2.3.4:3001` 或 `TANK_PUBLIC_URL=http://1.2.3.4:3001 npm run net:tunnel`
+// 于是：换域名/换 IP 后跑一次 net:tunnel 就能把稳定链接自动指到新地址，攻击者伪造 Host 完全无效。
 const probeBase = publicUrl || `http://127.0.0.1:${PORT}`;
-async function registerTrustedEntry(origin) {
+const entryArg = (argv.find((a) => a.startsWith("--entry=")) || "").slice("--entry=".length);
+const explicitEntry = (entryArg || process.env.TANK_PUBLIC_URL || "").trim();
+async function registerTrustedEntry(origin, { why = "预览地址" } = {}) {
   if (!origin) return false;
   const tokenFile = process.env.TANK_ENTRY_TOKEN_FILE || `/tmp/tank-entry-${PORT}.token`;
   let token = "";
@@ -141,12 +144,17 @@ async function registerTrustedEntry(origin) {
     });
     clearTimeout(t);
     const j = await res.json().catch(() => null);
-    if (res.ok && j && j.ok) {
-      try { (await import("node:fs")).writeFileSync(tokenFile + ".url", origin + "\n", "utf8"); } catch {}
-      line(`  ▸ 已登记「当前入口」= ${j.current}（带令牌的可信登记，伪造 Host 无法改写）`);
+    if (res.ok && j && j.ok && j.applied) {
+      if (j.persisted === false) {
+        // 服务器落盘失败（如只读 /tmp）：本地兜底写一份，别让"这次登记"白做
+        try { (await import("node:fs")).writeFileSync(tokenFile + ".url", j.current + "\n", { mode: 0o600 }); line("  ▸ （服务器未能落盘，已由本脚本兜底写入 .url）"); } catch {}
+      }
+      line(`  ▸ 已登记「当前入口」= ${j.current}（来源：${why}；带令牌的可信登记，伪造 Host 无法改写）`);
       return true;
     }
-    line(`  ▸ 入口登记未生效（HTTP ${res.status}）；稳定链接仍按服务器现有入口跳转`);
+    // 登记被拒时**必须说清原因**（此前 200 {"ok":true,"current":null} 的静默无效已修）
+    line(`  ▸ 入口登记未生效（HTTP ${res.status}）：${(j && j.error) || "未知原因"}`);
+    line(`     想指定入口可显式传：npm run net:tunnel -- --entry=http://<你的公网IP或域名>:${PORT}`);
   } catch (e) {
     line(`  ▸ 入口登记失败（${e && e.message}）；稳定链接仍按服务器现有入口跳转`);
   }
@@ -160,13 +168,20 @@ try {
   const j = await res.json();
   if (j && j.sid) {
     line("  ── 稳定入口（发给好友的链接，换域名/换 IP 都自动匹配）──");
-    // 先用可信令牌把「本次的实际公网域名」登记为当前入口（换域名后链接自动跟上新域名）
-    await registerTrustedEntry(publicUrl);
+    // 先用可信令牌把「本次的实际入口」登记为当前入口：
+    // 显式 --entry/TANK_PUBLIC_URL（IP 或域名）优先，否则用本次探测到的端口预览地址
+    if (explicitEntry) await registerTrustedEntry(explicitEntry, { why: "显式指定 --entry/TANK_PUBLIC_URL" });
+    else await registerTrustedEntry(publicUrl, { why: "平台端口预览地址" });
     const after = await fetch(probeBase + "/healthz").then((r) => r.json()).catch(() => j);
-    const entryOrigin = after.current || publicUrl || probeBase;
-    line(`  稳定链接:   ${entryOrigin}/${j.sid}/join/`);
     line(`  服务器内部 id: ${j.sid}（同一进程内恒定）`);
-    line(`  当前入口:   ${after.current || "-"}   |  自动匹配表: ${after.matched} 条`);
+    line(`  当前入口:   ${after.current || "-"}${after.currentSource ? `（来源：${after.currentSource}）` : ""}   |  自动匹配表: ${after.matched} 条`);
+    if (after.current) {
+      line(`  稳定链接:   ${after.current}/${j.sid}/join/`);
+    } else {
+      // 没有入口时**不打印 127.0.0.1 的"稳定链接"** —— 那在好友设备上指向他自己，会误导
+      line(`  稳定链接:   ✗ 暂不可用（还没有对外入口，点开只会看到提示页）`);
+      line(`    无域名部署就登记 IP：npm run net:tunnel -- --entry=http://<你的公网IP>:${PORT}`);
+    }
     line(`  ⚠ 环境重建/服务器重启后内部 id 会换新 → 需要重新分享一条链接（其余情况无需改链接）`);
     line();
   }

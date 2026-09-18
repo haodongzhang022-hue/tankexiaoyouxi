@@ -482,12 +482,7 @@ export class StableEntryManager {
       return c && STABLE_ENTRY_SID_RE.test(String(c.sid || "")) ? c : null;
     } catch { return null; }
   }
-  clear(): void { this.storage.removeItem(this.key); }
-  /** 服务器汇报的 sid 与手里稳定的 sid 是否一致（不一致说明环境已重建，链接需重新分享） */
-  matches(sid: string): boolean {
-    const c = this.peek();
-    return !!c && String(c.sid) === String(sid || "").toLowerCase();
-  }
+  // （v3.0.2 清理死代码：`matches()` / `clear()` 无任何调用方，删掉避免"看着有用其实没人用"的误导）
   /** 服务器每次心跳/欢迎都会汇报最新 sid → 自动滚动更新卡片（同一进程内 sid 不变，无需重分享） */
   adopt(sid: string, url?: string, roomId?: number | null): StableEntryCard | null {
     const s = String(sid || "").toLowerCase();

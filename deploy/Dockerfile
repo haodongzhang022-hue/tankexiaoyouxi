@@ -40,6 +40,10 @@ COPY scripts ./scripts
 # 服务器启动时要 import ../shared/preview-url.mjs（与 scripts 共用的单一事实源）
 COPY shared ./shared
 EXPOSE 3001
+# 入口登记令牌/登记结果的落盘位置：挂一个宿主机目录（-v $PWD/.tank-deploy:/data）后
+#   ① 部署脚本能读到令牌 → 带令牌登记「对外入口」（IP 形态也能登记，稳定链接才跳得对）；
+#   ② 登记结果（entry.token.url）重启后仍在，不用每次重新登记。
+ENV TANK_ENTRY_TOKEN_FILE=/data/entry.token
 # 健康检查：打 /healthz（只证明进程活着，不依赖 dist 是否构建），
 # 端口用 ${PORT} 而不是硬编码 —— 否则 -e PORT=8080 时容器永远 unhealthy。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \

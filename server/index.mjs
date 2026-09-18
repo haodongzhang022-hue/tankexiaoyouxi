@@ -20,9 +20,11 @@ import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket } from "ws";
 // 预览地址变量表/落盘读写的「单一事实源」（与 scripts/net-tunnel.mjs 共用同一份，避免漂移）
-import { detectPreviewUrl, writePublicUrl, PUBLIC_URL_FILE, PREVIEW_TPL_KEYS } from "../shared/preview-url.mjs";
+// ⚠ 只从单一事实源取「平台预览地址」与落盘读写；预览模板变量表（PREVIEW_TPL_KEYS）只被
+//   detectPreviewUrl 内部使用 —— 服务器不再自己拼模板域名（PR #8 评审 🔴3：自拼会产出未校验的垃圾域名）。
+import { detectPreviewUrl, writePublicUrl, PUBLIC_URL_FILE } from "../shared/preview-url.mjs";
 // 「稳定入口 ↔ 当前临时地址」自动匹配表（与共享层同一份实现，见 shared/entry-match.mjs）
-import { createEntryMatcher, entryPath, makeSid, SID_RE, ENTRY_TTL_MS, ENTRY_KEEPALIVE_MS, ENTRY_SWEEP_MS, currentOrigin, normalizeOrigin } from "../shared/entry-match.mjs";
+import { createEntryMatcher, entryPath, makeSid, SID_RE, ENTRY_TTL_MS, ENTRY_KEEPALIVE_MS, ENTRY_SWEEP_MS, normalizeOrigin, originScope, hasTemplatePlaceholder } from "../shared/entry-match.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DIST_DIR = path.resolve(__dirname, "..", "dist");
@@ -37,7 +39,7 @@ let lastClientSeenAt = 0;      // 最近一次收到任意客户端消息的时�
 
 // ── 稳定入口自动匹配 ────────────────────────────────────────────────
 // 服务器内部 id（sid）恒定到进程重启：分享出去的链接 /<sid>/join/<roomId> 因此是"稳定"的；
-// 平台环境重建/隧道换域名/换 IP 时，sid 会换新，但客户端心跳会把「新规格的地址」自动登记回匹配表，
+// 平台环境重建/隧道换域名/换 IP 时，sid 会换新；地址变化由**服务器自己**按可信来源刷新并写进匹配表，
 // 老链接打开时由 /:sid/join/:room 自动 302 到最新可用地址 —— 这就是"自动匹配到稳定之上"。
 // 可用 TANK_SID 固定（自测/复现方便），否则每次启动新生成 —— 稳定链接的"稳定"来自自动匹配，不来自硬编码
 const SID = SID_RE.test(String(process.env.TANK_SID || "").trim().toLowerCase())
@@ -50,25 +52,27 @@ const entries = createEntryMatcher(SID);
 // 若采信它来建立/迁移「当前入口」，那么一条 `curl -H "Host: evil.example.com" /healthz`
 // 就能把房主分享出去的稳定链接 302 到攻击者域名（钓鱼）。
 // 因此「当前入口」只认这三类**非请求方自报**的来源：
-//   ① 平台注入的端口预览模板（环境自己的域名，外部无法伪造）；
-//   ② 本机落盘的公网入口（部署脚本 / net:tunnel 显式登记，需先能 exec 进容器或写文件）；
-//   ③ 带一次性部署令牌的探针（令牌 = 进程启动时随机生成 + 打印到日志/落盘，仅部署者可取）。
+//   ① 带一次性部署令牌的探针显式登记（令牌 = 进程启动时随机生成 + 打印到日志/落盘，仅部署者可取）——
+//      **优先级最高**：部署者说「我的入口是 http://1.2.3.4:3001」就以此为准，不被平台模板顶回；
+//   ② 平台注入的端口预览模板（环境自己的域名，外部无法伪造；经 buildPreviewUrl 同口径校验，
+//      含残留占位符（如 {{port}}）或域名形态不合法的模板一律作废，绝不拿半成品当 302 目标）；
+//   ③ 上一次已被可信来源确立的当前入口（保持在服务的那个地址，不被匿名请求改写）。
 // 请求 Host 只在**已经存在**「当前入口」时用来做同源跳转判断，永远不参与建立与迁移。
 const ENTRY_PROBE_TOKEN_FILE = process.env.TANK_ENTRY_TOKEN_FILE || `/tmp/tank-entry-${PORT}.token`;
 const ENTRY_PROBE_TOKEN = crypto.randomBytes(16).toString("hex");
-try { fs.writeFileSync(ENTRY_PROBE_TOKEN_FILE, ENTRY_PROBE_TOKEN + "\n", { mode: 0o600 }); } catch { /* 落盘失败不影响服务 */ }
-/** 从 CNB_*_PROXY_URI 里取模板自带的域名部分（不含端口替换），作为「环境自身」的入口 */
-function previewTplOrigin() {
-  for (const k of PREVIEW_TPL_KEYS) {
-    const tpl = String(process.env[k] || "");
-    if (!tpl) continue;
-    const m = /^https?:\/\/[^/]*/i.exec(tpl.replace(/\{\{\s*port\s*\}\}/g, "0"));
-    if (!m) continue;
-    const o = normalizeOrigin(m[0].replace(/-0\./, "."));
-    if (isShareableOrigin(o)) return o;
+/** 令牌落盘：0600 + 不跟随符号链接（预置 0644 / 指向别处的符号链接都要挡住，见 PR #8 评审 🟡3） */
+function writeEntryTokenFile(file) {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW;
+    const fd = fs.openSync(file, flags, 0o600);
+    try { fs.writeSync(fd, ENTRY_PROBE_TOKEN + "\n"); } finally { fs.closeSync(fd); }
+    fs.chmodSync(file, 0o600);      // open 的 mode 对「已存在的文件」无效 → 显式收权
+  } catch (e) {
+    console.warn(`[入口令牌] 落盘失败（不影响服务，但部署脚本将无法带令牌登记）: ${e && e.message}`);
   }
-  return "";
 }
+writeEntryTokenFile(ENTRY_PROBE_TOKEN_FILE);
 
 // ── 静态文件服务（dist/）─────────────────────────────────────────
 const MIME = {
@@ -119,14 +123,29 @@ const httpServer = http.createServer((req, res) => {
   // 部署脚本（deploy/start-server.sh、net:tunnel）用它对公网域名显式登记/刷新「当前入口」，
   // 这样稳定链接既能在环境重建后自动跟上新域名，又不会被匿名请求伪造 Host 劫持。
   if (urlPath === "/entry/register") {
-    if (takeEntryTrustSignal(req, "entry/register")) {
-      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
-      res.end(JSON.stringify({ ok: true, current: CURRENT_ORIGIN || null, sid: SID }));
-    } else {
-      res.writeHead(403, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
-      res.end(JSON.stringify({ ok: false, error: "probe_token 缺失或无效" }));
+    const json = (code, obj) => {
+      res.writeHead(code, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+      res.end(JSON.stringify(obj));
+    };
+    if (!hasValidEntryToken(req)) return json(403, { ok: false, applied: false, error: "probe_token 缺失或无效", current: CURRENT_ORIGIN || null });
+    const raw = registeredUrlRaw(req);
+    if (!raw) return json(400, { ok: false, applied: false, error: "缺少 url 参数（用法：/entry/register?url=http://<你的公网IP或域名>:3001）", current: CURRENT_ORIGIN || null });
+    const applied = recordEntry(raw, "register", { allowPrivateIp: true });   // 可信登记：IP 形态同样放行
+    if (!applied) {
+      return json(400, {
+        ok: false, applied: false, requested: raw,
+        error: entryRejectReason(raw),
+        current: CURRENT_ORIGIN || null,
+      });
     }
-    return;
+    // 落盘登记（服务器每次刷新都会读它）——失败也要如实回报，不能让部署者以为"已生效"
+    const persisted = writeRegisteredEntryOrigin(applied);
+    return json(200, {
+      ok: true, applied: true, current: applied, persisted,
+      source: "register（带令牌显式登记，优先级最高）",
+      sid: SID,
+      note: persisted ? "已落盘，服务器重启后仍生效" : "仅进程内生效：落盘失败（检查 " + ENTRY_PROBE_TOKEN_FILE + ".url 的写权限）",
+    });
   }
   // 健康检查（供 Docker HEALTHCHECK / 云负载均衡 / 你自己 curl 用）
   // 与 "/" 的区别：这里只证明**服务进程活着**，不关心 dist 是否构建，返回极小的 JSON。
@@ -147,6 +166,7 @@ const httpServer = http.createServer((req, res) => {
       lastClientSeenS: lastClientSeenAt ? Math.round((Date.now() - lastClientSeenAt) / 1000) : null,
       clients: wss.clients.size,
       current: CURRENT_ORIGIN || null,
+      currentSource: CURRENT_SOURCE || null,   // 当前入口是哪来的（register / preview / keep）
       matched: entries.size(),          // 自动匹配表里的稳定入口条数
     }));
     return;
@@ -167,7 +187,9 @@ const httpServer = http.createServer((req, res) => {
     if (sid === SID) {
       // 目标只由服务器自己决定：当前入口（可信来源）优先；请求 Host 仅在「就是当前入口」时同源直跳。
       // ⚠ 绝不用请求 Host 兜底 —— 否则可被伪造 Host 把稳定链接 302 到攻击者域名（PR #7 评审 🔴1）。
-      const target = trustedTarget(req, (here, cur) => here === cur || here.replace(/^http:/, "https:") === cur);
+      const target = trustedTarget();
+      // 没有任何可信入口（既没登记、也没平台模板）→ 给可操作提示页，绝不回退到访问者的 127.0.0.1
+      if (!target) { sendEntryGone(res, SID, "no-entry"); return; }
       redirectTo(res, roomId ? `${target}/?room=${roomId}` : `${target}/`);
       return;
     }
@@ -184,7 +206,9 @@ const httpServer = http.createServer((req, res) => {
   if (mEntry) {
     takeEntryTrustSignal(req, "entry");
     if (mEntry[1] === SID) {
-      redirectTo(res, `${trustedTarget(req, (here, cur) => here === cur || here.replace(/^http:/, "https:") === cur)}/`);
+      const target = trustedTarget();
+      if (!target) sendEntryGone(res, SID, "no-entry");
+      else redirectTo(res, `${target}/`);
     }
     else {
       const e = entries.lookup(mEntry[1]);
@@ -245,10 +269,10 @@ const LAN_IPS = (() => {
 })();
 const SERVER_INFO = { lanIps: LAN_IPS, port: PORT };
 
-// ── 公网入口动态学习 ─────────────────────────────
-// 隧道(cpolar/cloudflared 等)转发请求时会带原始 Host 头（如 600ecc6f.r3.cpolar.cn）。
-// 服务器从任何进站 HTTP/WS 请求自动学习"当前公网域名"，随 welcome/tables 广播给所有
-// 客户端 → 游戏内邀请链接实时自动适配，隧道域名怎么变都不用手动改。
+// ── 公网入口（不再"从进站 Host 学习"）──────────────────────────
+// 历史写法：隧道(cpolar/cloudflared)转发时会带原始 Host，服务器从**任何进站请求**学习"当前公网域名"。
+// 这条路径已废除（PR #7 评审 🔴1）：Host 由调用方自报，一条 curl 就能把分享链接指到攻击者域名。
+// 现在入口只由可信来源确立（带令牌登记 / 平台预览模板 / 保持现状），随 welcome/tables 广播给客户端。
 // ── 端口预览地址探测（云原生开发自测用）──────────────────────────
 // 平台把端口预览模板注入到开发环境，形如 https://<环境ID>-{{port}}.<业务域名>。
 // 把 {{port}} 换成实际端口即得到该端口的公网预览地址（页面与 WS 同源）。
@@ -261,64 +285,83 @@ function persistPublicUrl(port) {
 
 // 当前对外入口（origin，如 https://xxx-3001.cnb.run）：只由可信来源确立（见 refreshCurrentOriginFromTrusted）
 let CURRENT_ORIGIN = "";
+let CURRENT_SOURCE = "";       // 入口来源标签（register / preview / keep），/healthz 可见，便于复评核对
 /**
  * 公网域名（仅用于邀请链接展示）；**从已确立的可信入口派生**，不再从进站 Host 学习。
  * 返回 host（不含协议），没有可信入口时返回 ""。
  */
 function publicHostOfCurrent() {
   const o = normalizeOrigin(CURRENT_ORIGIN);
-  if (!isShareableOrigin(o)) return "";
+  if (!isShareableOrigin(o, { allowPrivateIp: true })) return "";
   try { return new URL(o).host; } catch { return ""; }
 }
 function currentPublicHost() { return publicHostOfCurrent(); }
-function originOfRequest(req) {
-  const host = req && req.headers ? req.headers.host : "";
-  if (!host) return "";
-  const proto = String((req.headers && req.headers["x-forwarded-proto"]) || "").split(",")[0].trim()
-    || (/^https:/i.test(detectPreviewUrl(PORT) || "") ? "https" : "http");
-  return normalizeOrigin(`${proto}://${host}`);
-}
+// v3.0.2 说明：原本还有一个 originOfRequest(req)（用请求 Host + x-forwarded-proto 拼 origin）供
+// trustedTarget 做"同源省一跳"判断 —— x-forwarded-proto 由调用方控制，能伪造出 http:// 降级跳转
+// （PR #8 评审 🟢）。现在 302 目标一律是「已确立的可信入口」原文，不再需要它，故删除（死代码清零）。
 /**
  * 刷新「当前入口」并自动登记到匹配表（稳定入口 → 当前地址）。
  * ⚠ 只允许**可信来源**调用（见 recalcTrustedEntryOrigin）：入口地址决定了稳定链接的 302 目标，
  *   它一旦被请求方自报的 Host 影响，就等于把好友的链接指向攻击者域名。
  */
-function recordEntry(origin, why) {
-  const o = normalizeOrigin(origin);
-  if (!o) return "";
-  if (!isShareableOrigin(o)) return "";                 // 本机/内网地址不配当「当前入口」
+function recordEntry(origin, why, opts = {}) {
+  const info = originScope(origin, opts);
+  if (!info.ok) return "";                              // 回环/非法/残留占位符/未授权私网 IP：不登记（不瞎猜）
+  const o = info.origin;
   const prev = normalizeOrigin(CURRENT_ORIGIN);
   CURRENT_ORIGIN = o;
+  CURRENT_SOURCE = why;
   entries.bind(SID, o, null);
   if (prev !== o) console.log(`[匹配] 当前入口已变化: ${prev || "(空)"} → ${o}（来源：${why}；旧链接仍可用，打开会自动跳到新地址）`);
   return o;
 }
 
-/**
- * 重新计算「当前入口」——**只看可信来源**，不看请求 Host：
- *   ① 平台注入的端口预览地址 / 模板域名（环境自身，外部无法伪造）；
- *   ② 落盘登记的公网入口（部署脚本 / net:tunnel 显式写入 /tmp，需要容器内写权限）；
- *   ③ 上一次已被可信来源确立的当前入口（保持在服务的那个地址，不被匿名请求改写）。
- * /healthz 这类只读探针也走这里：没有可信来源时，current 保持为空 —— 宁可暂时没有入口，也不给坏地址。
- */
-function refreshCurrentOriginFromTrusted(why) {
-  const origin = currentOrigin([
-    detectPreviewUrl(PORT),
-    previewTplOrigin(),
-    readRegisteredEntryOrigin(),
-    detectPreviewUrl(PORT),
-    CURRENT_ORIGIN,
-  ]);
-  if (origin) recordEntry(origin, why);
+/** 登记被拒的原因（回给部署脚本，避免"静默无效"） */
+function entryRejectReason(origin) {
+  return originScope(origin, { allowPrivateIp: true }).reason || "地址不可用作对外入口";
 }
 
-/** 读取「落盘登记」的公网入口（部署脚本写、服务器读）；不存在/不合法返回 "" */
+/**
+ * 重新计算「当前入口」——**只看可信来源**，不看请求 Host（优先级由高到低）：
+ *   ① 显式登记（部署脚本 / net:tunnel 写入 `<token>.url`，需令牌或容器内写权限）——
+ *      部署者说了算：不会被平台模板的下一轮刷新顶回（PR #8 评审 🟡1）；
+ *   ② 平台注入的端口预览地址（经 detectPreviewUrl → buildPreviewUrl 同口径校验，残留占位符作废）；
+ *   ③ 上一次已被可信来源确立的当前入口（保持在服务的那个地址，不被匿名请求改写）。
+ * /healthz 这类只读探针也走这里：没有可信来源时，current 保持为空 —— 宁可暂时没有入口，也不给坏地址
+ * （此时稳定链接给 sendEntryGone 提示页，而不是把好友 302 到 127.0.0.1）。
+ */
+function refreshCurrentOriginFromTrusted(why) {
+  // 优先级：① 显式登记（部署者说了算，不被下一次刷新顶回）→ ② 平台预览模板 → ③ 保持现有入口
+  const explicit = readRegisteredEntryOrigin();
+  if (explicit) { recordEntry(explicit, "register", { allowPrivateIp: true }); return; }
+  const preview = detectPreviewUrl(PORT);              // 已做「无残留占位符」校验的单一事实源
+  if (preview) { recordEntry(preview, `${why}:preview`); return; }
+  if (CURRENT_ORIGIN) recordEntry(CURRENT_ORIGIN, `${why}:keep`);
+}
+
+/**
+ * 落盘登记的对外入口（部署脚本 / net:tunnel 写 `<token file>.url`，服务器读）。
+ * 存在 = 部署者**显式指定**了入口 → 优先级最高（不会被平台模板的下一轮刷新顶回，见 PR #8 评审 🟡1）。
+ */
 function readRegisteredEntryOrigin() {
   try {
     const raw = fs.readFileSync(ENTRY_PROBE_TOKEN_FILE + ".url", "utf8").trim();
-    const o = normalizeOrigin(raw);
-    return isShareableOrigin(o) ? o : "";
+    if (!raw || hasTemplatePlaceholder(raw)) return "";
+    const info = originScope(raw, { allowPrivateIp: true });
+    return info.ok ? info.origin : "";
   } catch { return ""; }
+}
+
+/** 把显式登记的入口落盘（服务器重启/刷新都从这份读）；返回是否写成功 */
+function writeRegisteredEntryOrigin(origin) {
+  try {
+    fs.mkdirSync(path.dirname(ENTRY_PROBE_TOKEN_FILE), { recursive: true });
+    fs.writeFileSync(ENTRY_PROBE_TOKEN_FILE + ".url", origin + "\n", { mode: 0o600 });
+    return true;
+  } catch (e) {
+    console.warn(`[入口登记] 落盘失败: ${e && e.message}`);
+    return false;
+  }
 }
 
 /**
@@ -330,12 +373,18 @@ function readRegisteredEntryOrigin() {
  * @returns {boolean} 是否携带了有效令牌
  */
 function takeEntryTrustSignal(req, why) {
-  const token = probeTokenOf(req);
-  if (!token || token !== ENTRY_PROBE_TOKEN) return false;
+  if (!hasValidEntryToken(req)) return false;
   const registered = registeredUrlOf(req);            // 部署探针可显式登记「本环境对外的公网入口」
-  if (registered) recordEntry(registered, `${why}:register`);
+  if (registered) recordEntry(registered, `${why}:register`, { allowPrivateIp: true });
   else refreshCurrentOriginFromTrusted(`${why}:probe`);
   return true;
+}
+
+/** 请求是否携带正确的部署令牌（时间恒定比较，避免时序侧信道） */
+function hasValidEntryToken(req) {
+  const token = probeTokenOf(req);
+  if (!token || token.length !== ENTRY_PROBE_TOKEN.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(token), Buffer.from(ENTRY_PROBE_TOKEN));
 }
 
 function probeTokenOf(req) {
@@ -347,13 +396,17 @@ function probeTokenOf(req) {
   } catch { return ""; }
 }
 
-function registeredUrlOf(req) {
+/** 取登记参数里的原始 url（不判合法性：不合法要能回一句为什么，而不是静默 null） */
+function registeredUrlRaw(req) {
   try {
     const q = new URL(req.url || "/", "http://x").searchParams;
-    const raw = (q.get("url") || q.get("origin") || "").trim();
-    const o = normalizeOrigin(raw);
-    return isShareableOrigin(o) ? o : "";
+    return (q.get("url") || q.get("origin") || "").trim();
   } catch { return ""; }
+}
+function registeredUrlOf(req) {
+  const raw = registeredUrlRaw(req);
+  const info = originScope(raw, { allowPrivateIp: true });
+  return info.ok ? info.origin : "";
 }
 
 /**
@@ -364,50 +417,42 @@ function registeredUrlOf(req) {
 function confirmOriginFromClient() {
   lastClientSeenAt = Date.now();
 }
-/** 是否为「可分享的公网入口」：域名（非 IP）+ 非本机/内网。用于决定稳定链接跳到哪儿。 */
-function isShareableOrigin(origin) {
-  try {
-    const u = new URL(String(origin));
-    const h = u.hostname.toLowerCase();
-    if (!h) return false;
-    if (h === "localhost" || h === "0.0.0.0" || h === "::1") return false;
-    if (/^(\d{1,3}\.){3}\d{1,3}$/.test(h)) return false;                       // 纯 IP（含局域网）不可分享
-    return true;
-  } catch { return false; }
+/**
+ * 是否为「可分享的对外入口」。
+ * v3.0.2（PR #8 评审 🔴2）：**公网 IP 与（可信来源显式登记的）局域网 IP 都算数** ——
+ * 「没有域名」的部署形态（deploy/Dockerfile + start-server.sh 主推形态）必须能拿到入口，
+ * 否则稳定链接只能落到 127.0.0.1 兜底，等于把好友送到他自己的机器上。
+ * 回环（127./::1/localhost）与未授权私网地址仍然拒收。
+ */
+function isShareableOrigin(origin, opts = {}) {
+  return originScope(origin, opts).ok;
 }
 
-/** 匹配表里**最近**登记到的一个可用地址（含本机内网地址时会被过滤掉，不会是 localhost） */
-function latestEntryOrigin() {
-  let best = "";
-  let bestAge = Infinity;
-  for (const e of entries.list()) {
-    if (e.ageMs < bestAge) { best = e.current; bestAge = e.ageMs; }
-  }
-  return best;
-}
-
-/** 由「已确立的可信当前入口」派生的公网地址（不含本机/内网），供跳转兜底使用 */
-function previousPublicOrigin() {
+/** 可信来源兜底地址（登记表里的最新一条 / 已确立入口的 host / 平台预览地址），都不是回环 */
+function fallbackEntryOrigin() {
+  const cands = [normalizeOrigin(CURRENT_ORIGIN)];
   const h = publicHostOfCurrent();
-  return h ? `https://${h}` : "";
+  if (h) cands.push(`https://${h}`);
+  for (const e of entries.list()) cands.push(normalizeOrigin(e.current));
+  cands.push(normalizeOrigin(detectPreviewUrl(PORT)));
+  return cands.find((c) => c && isShareableOrigin(c, { allowPrivateIp: true })) || "";
 }
 
 /**
  * 稳定链接该跳到哪儿：**只由服务器自己决定**，绝不用访问者自报的 Host 兜底。
- *   ① 已确立的当前入口（可信来源）→ 用它；同源访问时直接用请求域名（少一跳）；
- *   ② 否则退回匹配表/已登记地址（同样来自可信来源）；
- *   ③ 实在没有 → 本机回环（可达、但不是攻击者域名）：宁可这一跳不明显，也不给坏地址/钓鱼地址。
+ *   ① 已确立的当前入口（可信来源）→ 用它；访问者**就在这个入口上**（Host 与入口一致）时直跳，省一跳；
+ *   ② 否则退回登记表/已确立入口（同样来自可信来源）；
+ *   ③ 实在没有 → 返回 ""（调用方给 sendEntryGone 提示页）。
+ *      ⚠ v3.0.2：不再回退 `http://127.0.0.1:PORT` —— 那会把好友 302 到**他自己**机器的回环地址
+ *        （甚至可能是他自己跑的服务），比"暂时没有入口"更糟（PR #8 评审 🔴2）。
  */
-function trustedTarget(req, sameOriginWhen) {
-  const here = normalizeOrigin(originOfRequest(req));
+function trustedTarget() {
+  // 目标 = 「已确立的可信入口」原文（不掺入访问者的任何自报信息）。
+  // 同源访问时访问者用的就是这条地址本身，302 回它等价于"原地不动"，因此不需要另算"省一跳"的地址 ——
+  // 旧写法用请求 Host + x-forwarded-proto 拼同源地址，可被伪造出 http:// 降级跳转（PR #8 评审 🟢）。
   const cur = normalizeOrigin(CURRENT_ORIGIN);
-  if (cur && isShareableOrigin(cur)) {
-    const same = sameOriginWhen ? sameOriginWhen(here, cur) : here === cur;
-    return same ? here : cur;
-  }
-  const fallback = [latestEntryOrigin(), previousPublicOrigin(), detectPreviewUrl(PORT)]
-    .map(normalizeOrigin).find(isShareableOrigin);
-  return fallback || `http://127.0.0.1:${PORT}`;
+  if (cur && isShareableOrigin(cur, { allowPrivateIp: true })) return cur;
+  return fallbackEntryOrigin();
 }
 
 function redirectTo(res, location) {
@@ -415,14 +460,27 @@ function redirectTo(res, location) {
   res.end(`正在自动匹配到当前地址…\n${location}\n`);
 }
 
-/** 稳定入口对应的环境已经换了（服务器内部 id 变了）：给出可操作的提示，而不是干巴巴 404 */
-function sendEntryGone(res, sid) {
-  sendHtml(res, 200, `<!DOCTYPE html><html lang="zh"><meta charset="utf-8">
-<title>坦克大战 · 入口已失效</title><body style="background:#0a0a0a;color:#ddd;font-family:monospace;padding:32px;line-height:1.9">
-<h2 style="color:#ffd700">这条链接暂时匹配不到服务器</h2>
-<p>链接里的服务器内部 id <b>${String(sid).replace(/[^0-9a-f]/gi, "")}</b> 已不再服务（环境被回收或服务器已重启）。</p>
+/**
+ * 稳定入口打不开时的**可操作提示页**（而不是干巴巴 404，也不是把好友 302 到他自己机器）：
+ *   reason = "gone"     → 链接里的 sid 已不再服务（环境被回收 / 服务器已重启）
+ *   reason = "no-entry" → 这台服务器还活着，但**没有确立对外入口**（既没平台模板，也没人带令牌登记）
+ */
+function sendEntryGone(res, sid, reason = "gone") {
+  const safeSid = String(sid).replace(/[^0-9a-f]/gi, "");
+  const body = reason === "no-entry"
+    ? `<h2 style="color:#ffd700">这台服务器还没有对外入口</h2>
+<p>服务器本身是在跑的，但它没有「公网地址」可跳 —— 所以这条链接暂时打不开（这比给你一个错地址要安全）。</p>
+<p>让部署的人补一条**带令牌的登记**即可（IP 或域名二选一，登记后本页就会自动跳过去）：</p>
+<pre style="color:#4af">curl -H "X-Tank-Entry-Token: $(cat ${ENTRY_PROBE_TOKEN_FILE})" \
+     "http://127.0.0.1:${PORT}/entry/register?url=http://&lt;你的公网IP或域名&gt;:${PORT}"</pre>
+<p style="color:#888">部署脚本 deploy/start-server.sh 已内置这一步；手动跑的话上面的命令就是它做的全部事情。</p>`
+    : `<h2 style="color:#ffd700">这条链接暂时匹配不到服务器</h2>
+<p>链接里的服务器内部 id <b>${safeSid}</b> 已不再服务（环境被回收或服务器已重启）。</p>
 <p>请让房主重新分享一条链接 —— 新链接会自动匹配到新的临时地址，无需手动改 IP/域名。</p>
-<p style="color:#888">（本机仍在线的话：<a style="color:#4af" href="/">打开当前服务器</a>）</p>
+<p style="color:#888">（本机仍在线的话：<a style="color:#4af" href="/">打开当前服务器</a>）</p>`;
+  sendHtml(res, 200, `<!DOCTYPE html><html lang="zh"><meta charset="utf-8">
+<title>坦克大战 · 入口暂时不可用</title><body style="background:#0a0a0a;color:#ddd;font-family:monospace;padding:32px;line-height:1.9">
+${body}
 </body></html>`);
 }
 
@@ -501,8 +559,8 @@ function broadcastTables(filterTableId = null) {
     if (filterTableId !== null && t.id === filterTableId) continue;
     list.push(fullTableView(t));
   }
-  // 携带动态学习的公网域名，客户端实时刷新邀请链接
-  const msg = JSON.stringify({ t: "tables", tables: list, publicHost: currentPublicHost() || undefined });
+  // 携带可信来源确立的当前入口，客户端实时刷新邀请链接
+  const msg = JSON.stringify({ t: "tables", tables: list, publicHost: currentPublicHost() || undefined, publicOrigin: normalizeOrigin(CURRENT_ORIGIN) || undefined });
   for (const c of wss.clients) {
     if (c.readyState === WebSocket.OPEN && c.conn) c.send(msg);
   }
@@ -528,8 +586,8 @@ wss.on("connection", (ws, req) => {
   const conn = { id: nextClient++, name: "玩家", tableId: null, idx: -1 };
   ws.conn = conn;
   lastClientSeenAt = Date.now();
-  // serverInfo：告知客户端本机的真实局域网地址 + 动态学习的公网入口
-  sendRaw(ws, { t: "welcome", clientId: conn.id, serverInfo: SERVER_INFO, publicHost: currentPublicHost() || undefined, sid: SID, url: normalizeOrigin(CURRENT_ORIGIN) || undefined, entryPath: entryPath(SID) });
+  // serverInfo：告知客户端本机的真实局域网地址 + 可信来源确立的当前入口
+  sendRaw(ws, { t: "welcome", clientId: conn.id, serverInfo: SERVER_INFO, publicHost: currentPublicHost() || undefined, publicOrigin: normalizeOrigin(CURRENT_ORIGIN) || undefined, sid: SID, url: normalizeOrigin(CURRENT_ORIGIN) || undefined, entryPath: entryPath(SID) });
   broadcastTables(null);
 
   ws.on("message", (raw) => {
@@ -936,12 +994,17 @@ httpServer.listen(PORT, HOST, () => {
   console.log(`  ── 稳定入口（分享给好友的链接形状，换域名/换 IP 都不用改）──`);
   console.log(`  服务器内部 id: ${SID}（同一进程内恒定；环境重建/重启后自动换新并自动匹配）`);
   console.log(`  稳定链接:      <当前入口>${entryPath(SID)}        ← 例如 ${CURRENT_ORIGIN || "http://<你的地址>"}${entryPath(SID)}`);
-  console.log(`  入口登记令牌:  已写入 ${ENTRY_PROBE_TOKEN_FILE}（0600）；部署/隧道脚本可显式登记公网入口：`);
+  console.log(`  入口登记令牌:  已写入 ${ENTRY_PROBE_TOKEN_FILE}（0600）；部署/隧道脚本可显式登记对外入口：`);
   console.log(`                 curl -H "X-Tank-Entry-Token: $(cat ${ENTRY_PROBE_TOKEN_FILE})" \\`);
-  console.log(`                      "http://127.0.0.1:${PORT}/entry/register?url=https://你的公网域名"`);
+  console.log(`                      "http://127.0.0.1:${PORT}/entry/register?url=http://203.0.113.9:${PORT}"`);
+  console.log(`                 ↑ 公网 IP 或域名都行（无域名部署形态照样能分享）；登记结果落盘，重启后仍生效`);
   console.log(`  （只有带令牌的探针能改写「当前入口」—— 伪造 Host 无法把分享链接指向别处）`);
-  console.log(`  自动匹配:      打开稳定链接 → 302 到"当前实际可用地址"；匹配表 ${entries.size()} 条，${ENTRY_TTL_MS / 60000} 分钟无心跳自动解绑`);
-  console.log(`  自检:          GET ${CURRENT_ORIGIN || ""}/healthz （ok/clients/sid/matched）`);
+  if (!CURRENT_ORIGIN) {
+    console.log(`  ⚠ 当前还没有对外入口：稳定链接会给出可操作提示页（不会把好友送到 127.0.0.1）。`);
+    console.log(`    无域名部署请跑上面那条 curl 登记；deploy/start-server.sh 已内置这一步。`);
+  }
+  console.log(`  自动匹配:      打开稳定链接 → 302 到"当前实际可用地址"；匹配表 ${entries.size()} 条，${ENTRY_TTL_MS / 60000} 分钟没被刷新碰过的条目会被清掉`);
+  console.log(`  自检:          GET ${CURRENT_ORIGIN || `http://127.0.0.1:${PORT}`}/healthz （ok/clients/sid/current/currentSource/matched）`);
   console.log(`  外网分享:   用路由器端口转发 / ngrok / frp / Cloudflare Tunnel 暴露 ${PORT} 端口后，把公网地址发给好友`);
   console.log(`  提示: 若提示没有游戏页面，请先在项目目录执行 npm run build`);
 });

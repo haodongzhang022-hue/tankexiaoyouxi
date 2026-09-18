@@ -67,7 +67,8 @@ export class NetClient {
   private _players: Array<{ clientId: number; name: string }> = [];
   private _seed = 0;
   private _serverInfo: ServerInfo | null = null;   // 服务器的真实局域网地址
-  private _publicHost: string | null = null;        // 服务器动态学习的当前公网隧道域名
+  private _publicHost: string | null = null;        // 服务器可信来源确立的当前入口 host（展示用）
+  private _publicOrigin: string | null = null;      // 同上，但带协议与端口（生成邀请链接用，IP 形态也能用）
   private _sid: string | null = null;               // 服务器内部 id（稳定入口用；环境重建会换新）
   private _entryUrl: string | null = null;          // 服务器汇报的「当前实际入口」地址（自动匹配源）
   /** 稳定链接优先的候选（URL 对象，每次重连实时求值）→ 断线后自动跳到最新地址 */
@@ -89,8 +90,10 @@ export class NetClient {
   get seed(): number { return this._seed; }
   /** 服务器在 welcome 里报告的局域网地址（可能为 null，如旧版服务器） */
   get serverInfo(): ServerInfo | null { return this._serverInfo; }
-  /** 服务器动态学习的公网隧道域名（隧道域名变化自动更新，用于邀请链接） */
+  /** 服务器可信来源确立的当前入口 host（IP 形态时就是 IP:端口） */
   get publicHost(): string | null { return this._publicHost; }
+  /** 服务器可信来源确立的当前入口完整 origin（带协议/端口；没有入口时为 null） */
+  get publicOrigin(): string | null { return this._publicOrigin; }
   /** 服务器内部 id（8 位十六进制；同一进程内恒定，环境重建/重启后换新） */
   get sid(): string | null { return this._sid; }
   /** 服务器汇报的「当前实际入口」地址（稳定链接 302 的目标） */
@@ -207,11 +210,13 @@ export class NetClient {
           this._serverInfo = { lanIps: si.lanIps.map(String), port: Number(si.port) || 3001 };
         }
         if (typeof m.publicHost === "string" && m.publicHost) this._publicHost = m.publicHost;
+        if (typeof m.publicOrigin === "string" && m.publicOrigin) this._publicOrigin = m.publicOrigin.replace(/\/+$/, "");
         this.applyEntry(m.sid, m.url);
         this.emit("welcome", this._myClientId); break;
       }
       case "tables":
         if (typeof m.publicHost === "string" && m.publicHost) this._publicHost = m.publicHost;
+        if (typeof m.publicOrigin === "string" && m.publicOrigin) this._publicOrigin = m.publicOrigin.replace(/\/+$/, "");
         this.emit("tables", m.tables); break;
       case "table": this.emit("table", m.table); break;
       case "start": {

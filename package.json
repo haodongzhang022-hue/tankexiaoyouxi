@@ -8,7 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "online": "node server/index.mjs",
-    "test": "vitest run",
+    "test": "vitest run && npm run net:entry-test",
     "test:watch": "vitest",
     "test:debug": "vitest run --inspect-brk --no-file-parallelism",
     "dual": "node scripts/quick-dual-test.mjs",

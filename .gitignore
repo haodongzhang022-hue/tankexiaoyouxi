@@ -16,6 +16,9 @@ tools/
 *.msi
 *.lnk
 
+# deploy 运行时产物（令牌 / 登记入口，绝不入库）
+.tank-deploy/
+
 # logs / temp
 *.log
 *.log.*
