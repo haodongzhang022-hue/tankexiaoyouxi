@@ -16,10 +16,12 @@ const note = (s) => console.log(`   · ${s}`);
 const browser = await puppeteer.launch({ headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
 
 /** 每个检查用独立 browser context（隔离 localStorage 重连卡 / 剪贴板 / 会话） */
-async function open(port, vw, vh, query) {
+async function open(port, vw, vh, query, mobile = false) {
   const ctx = await browser.createBrowserContext();
   const page = await ctx.newPage();
-  await page.setViewport({ width: vw, height: vh });
+  await page.setViewport(mobile
+    ? { width: vw, height: vh, isMobile: true, hasTouch: true, deviceScaleFactor: 2 }
+    : { width: vw, height: vh });
   page.on("pageerror", (e) => note(`[pageerror:${port}] ${String(e).slice(0, 120)}`));
   await page.goto(`http://127.0.0.1:${port}/${query}`, { waitUntil: "networkidle2" });
   await sleep(1600);
@@ -225,15 +227,31 @@ try {
     ok(`🔴2 [${label}] 点滚动后出现的行 → 进桌 #${target.id}`, st.inTable === true && room === target.id,
       `inTable=${st.inTable} room=${room} 期望=#${target.id}`);
     await tap(page, "Escape"); await sleep(600);
-    // ③ 键盘 ↓ 选到视口外 → 列表跟随滚动（选中行始终可见）
+    // ③ 触屏/鼠标拖拽滚动：拖拽只滚动、不误进桌；且拖后能点到视口外新出现的行
     await page.evaluate(`window.__tankDebug.scrollLobby(0)`);
     await sleep(300);
-    for (let i = 0; i < geo.maxRows + 3; i++) await tap(page, "ArrowDown");
+    const beforeDrag = j(await dbg(page, `d.visibleRoomRows()[0].id`));
+    await page.evaluate(`window.__tankDebug.drag(60, ${geo.top + 60}, ${geo.top + 60 - geo.step * 4})`);
+    await sleep(600);
+    const afterDrag = j(await dbg(page, `d.visibleRoomRows()`));
+    const stDrag = j(await dbg(page, `d.state()`));
+    ok(`🔴2 [${label}] 拖拽滚动列表（手势）：滚动生效且不误进桌`,
+      afterDrag.length > 0 && afterDrag[0].id !== beforeDrag && stDrag.inTable === false,
+      `首行 ${beforeDrag} → ${afterDrag[0]?.id}；拖拽后 inTable=${stDrag.inTable}（应为 false）`);
+
+    // ④ 键盘 ↓ 选到视口外 → 列表跟随滚动（选中行始终可见）
+    await page.evaluate(`window.__tankDebug.scrollLobby(0); window.__tankDebug.selectRoomRow(0)`);
+    await sleep(400);
+    const kbStart = j(await dbg(page, `d.visibleRoomRows()[0].id`));
+    const kbMoves = geo.maxRows + 3;                 // 越过视口 3 行
+    for (let i = 0; i < kbMoves; i++) await tap(page, "ArrowDown");
     const rowsKb = j(await dbg(page, `d.visibleRoomRows()`));
     const stKb = j(await dbg(page, `d.state()`));
-    const inView = rowsKb.length > 0 && rowsKb.some((r) => r.y >= geo.top && r.y + r.h <= geo.bottom);
+    const selRow = rowsKb.find((r) => r.y >= geo.top && r.y + r.h <= geo.bottom);
+    // 选中行已越出初始视口 → 列表必须跟随滚动（首行不再是 1），且选中行仍在视口内
     ok(`🔴2 [${label}] 键盘 ↓ 越过视口 → 列表自动滚动，选中行仍在视口内`,
-      inView && rowsKb[0].id !== 1, `可见行=${rowsKb.length} 首行 id=${rowsKb[0]?.id} state=${stKb.state}`);
+      rowsKb.length > 0 && rowsKb[0].id !== kbStart && !!selRow && stKb.state === "online",
+      `按 ↓ ${kbMoves} 次：首行 ${kbStart} → ${rowsKb[0]?.id}；视口内可见行=${rowsKb.length} state=${stKb.state}`);
     await ctx.close();
   }
 
@@ -283,6 +301,44 @@ try {
       `pending=null:${stopped} msg="${msg}"`);
     await fifth.ctx.close();
     for (const p of pages) await p.ctx.close();
+  }
+
+  // ═════════ 🔴2 附加：真机触屏（移动端 390×844，dpr=2）——真实 touch 事件点行 / 拖拽滚动 ═════════
+  {
+    const { ctx, page } = await open(3001, 390, 844, "?room=1&debug=1", true);
+    await waitFor(page, `d.state().inTable === true`);
+    await tap(page, "Escape"); await sleep(900);
+    const geo = j(await dbg(page, `d.lobbyGeom()`));
+    const rows = j(await dbg(page, `d.visibleRoomRows()`));
+    // CSS ↔ 逻辑坐标换算（与 app 同一口径：CSS / 逻辑尺寸，不是物理缓冲尺寸）
+    const g = await page.evaluate(() => {
+      const c = document.getElementById("game-canvas");
+      const r = c.getBoundingClientRect();
+      const s = window.__tankDebug.canvasSize();
+      return { left: r.left, top: r.top, sx: r.width / s.w, sy: r.height / s.h };
+    });
+    const css = (x, y) => [g.left + x * g.sx, g.top + y * g.sy];
+    const target = rows[Math.floor(rows.length / 2)];
+    const [tx, ty] = css(120, target.y + target.h / 2);
+    await page.touchscreen.tap(tx, ty);
+    await sleep(1200);
+    const st = j(await dbg(page, `d.state()`));
+    const room = j(await dbg(page, `d.room()`));
+    ok(`🔴2 [移动端 390×844 dpr=2] 真实触屏点房间行 → 进桌 #${target.id}`,
+      st.inTable === true && room === target.id, `inTable=${st.inTable} room=${room} 期望=#${target.id}`);
+    await tap(page, "Escape"); await sleep(900);
+    await page.evaluate(`window.__tankDebug.scrollLobby(0)`); await sleep(400);
+    const before = j(await dbg(page, `d.visibleRoomRows()[0].id`));
+    const [sx0, sy0] = css(120, geo.top + 80);
+    await page.touchscreen.touchStart(sx0, sy0);
+    for (let i = 1; i <= 10; i++) { await page.touchscreen.touchMove(sx0, sy0 - (geo.step * 5) * i / 10); await sleep(20); }
+    await page.touchscreen.touchEnd();
+    await sleep(900);
+    const after = j(await dbg(page, `d.visibleRoomRows()[0].id`));
+    const st2 = j(await dbg(page, `d.state()`));
+    ok(`🔴2 [移动端 390×844 dpr=2] 真实触屏拖拽 → 列表滚动且不误进桌`,
+      after !== before && st2.inTable === false, `首行 ${before} → ${after}，inTable=${st2.inTable}`);
+    await ctx.close();
   }
 
   // ═════════ 🟡3 「对局中」错误文案按真实原因分档 ═════════

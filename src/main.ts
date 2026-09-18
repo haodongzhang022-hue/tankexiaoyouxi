@@ -1,6 +1,6 @@
 // main.ts
 import { GameLoop } from "./engine/GameLoop";
-import { Renderer } from "./engine/Renderer";
+import { Renderer, logicalCanvasSize } from "./engine/Renderer";
 import { InputManager, type PlayerInput } from "./engine/InputManager";
 import { getSoundManager } from "./engine/SoundManager";
 import { GamepadAdapter } from "./input/GamepadAdapter";
@@ -487,8 +487,13 @@ canvas.addEventListener("pointerdown", (e) => {
   if (!r.width || !r.height) return;
   const x = (e.clientX - r.left) * (currentLayout.canvasW / r.width);
   const y = (e.clientY - r.top) * (currentLayout.canvasH / r.height);
-  // v2.38 大厅房间列表：按下只记录手势（拖动 = 滚动列表；抬手未拖动 = 进桌，交给下面的按钮命中）
-  if (lobbyListHit(x, y)) lobbyDrag = { startY: y, startScroll: lobbyScroll, moved: false };
+  // v2.38 大厅房间列表：按下**不立即进桌**，先记手势 —— 拖动 = 滚动列表，抬手未拖动 = 进桌。
+  //       （必须延迟到抬手结算，否则"想滚动"会先在按下瞬间把房间点进去）
+  if (lobbyListHit(x, y)) {
+    const row = lobbyRowAt(y);
+    lobbyDrag = { startY: y, startScroll: lobbyScroll, moved: false, row };
+    if (row) return;   // 列表行由 pointerup 结算，不走下面的即时命中
+  }
   // 联机成员：点击转发给远端视图（升级面板点选等），暂停时不转发；对局结束后改走结束菜单按钮
   const overOnline = (state === "online_host" && !!host?.isOver) || (state === "online_client" && !!remoteView?.isOver());
   if (state === "online_client" && remoteView && !paused && !overOnline) {
@@ -509,10 +514,6 @@ canvas.addEventListener("pointerdown", (e) => {
   // 暂停状态 / 菜单 / 联机大厅 / 设置页 / 游戏结束 / 联机结束画面：处理 lobbyButtons 点击
   // v2.18 修复：gameover 状态也需要处理点击（手机端无Enter键，只能点按钮）
   if ((state !== "online" && state !== "menu" && state !== "settings" && state !== "gameover" && !overOnline && !paused) || lobbyButtons.length === 0) return;
-  // v2.38 列表拖拽滚动过（位移 > 6px）→ 本次抬手不算点击，避免"想滚动却进了桌"
-  const dragged = lobbyDrag?.moved === true;
-  lobbyDrag = null;
-  if (dragged) return;
   for (let i = lobbyButtons.length - 1; i >= 0; i--) {
     const b = lobbyButtons[i];
     if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) {
@@ -537,7 +538,7 @@ window.addEventListener("pointermove", (e) => {
   const p = onlineDragXY(e);
   if (p) remoteView.dragPointerMove(p.x, p.y);
 });
-window.addEventListener("pointerup", () => { lobbyDrag = null; });
+window.addEventListener("pointerup", () => { lobbyDrag = null; });   // 指针移出画布也要清手势
 canvas.addEventListener("pointermove", (e) => {
   if (!lobbyDrag) return;
   const r = canvas.getBoundingClientRect();
@@ -550,6 +551,14 @@ canvas.addEventListener("pointermove", (e) => {
     const maxScroll = Math.max(0, lobbyScrollMaxRows());
     lobbyScroll = Math.max(0, Math.min(lobbyDrag.startScroll - rows, maxScroll));
   }
+});
+// v2.38 列表行"抬手结算"：未拖动（位移 ≤6px）→ 进该桌；拖动过 → 只当滚动，不进桌
+canvas.addEventListener("pointerup", () => {
+  const d = lobbyDrag;
+  lobbyDrag = null;
+  if (!d || !d.row || d.moved) return;
+  getSoundManager().play("pickup");
+  onlineJoin(d.row);
 });
 // 滚轮滚动房间列表（桌面端）
 canvas.addEventListener("wheel", (e) => {
@@ -1085,6 +1094,20 @@ function lobbyListGeom(W: number, H: number) {
   const maxRows = Math.max(1, Math.floor((bottom - LOBBY_LIST_TOP - LOBBY_ROW_H) / LOBBY_ROW_STEP) + 1);
   return { listW, top: LOBBY_LIST_TOP, bottom, maxRows, rowH: LOBBY_ROW_H, step: LOBBY_ROW_STEP, colX, colW, sideCol, auxRowY };
 }
+/**
+ * 大厅列表：给定画布 y → 命中的桌（未命中任何可视行则 null）。
+ * 与 renderOnline 用同一套几何（lobbyListGeom + lobbyScroll），避免"画在哪 / 点在哪"两处漂移。
+ */
+function lobbyRowAt(y: number): NetTable | null {
+  const geo = lobbyListGeom(currentLayout.canvasW, currentLayout.canvasH);
+  if (y < geo.top || y > geo.bottom) return null;
+  const idx = Math.floor((y - geo.top) / geo.step);
+  const rowTop = geo.top + idx * geo.step;
+  if (y > rowTop + geo.rowH) return null;             // 行间空隙（step - rowH = 4px）不算命中
+  const filtered = onlineTables.filter((t) => t.mode === onlineMode);
+  const t = filtered[lobbyScroll + idx];
+  return t ?? null;
+}
 /** 大厅房间列表滚动位置（首个可见行下标）；滚轮/触屏拖拽/键盘选中都会调整它 */
 let lobbyScroll = 0;
 /** 本帧实际渲染并注册了点击的房间行（e2e 断言"列表过滤/滚动真的生效"用；随帧重建） */
@@ -1097,8 +1120,8 @@ function lobbyScrollMaxRows(): number {
   const n = onlineTables.filter((t) => t.mode === onlineMode).length;
   return Math.max(0, n - geo.maxRows);
 }
-/** 列表内的指针手势：轻点 = 进桌，拖拽 = 滚动 */
-let lobbyDrag: { startY: number; startScroll: number; moved: boolean } | null = null;
+/** 列表内的指针手势：轻点 = 进桌（抬手时结算），拖拽 = 滚动（滚动时取消进桌） */
+let lobbyDrag: { startY: number; startScroll: number; moved: boolean; row: NetTable | null } | null = null;
 
 // ── v2.38 桌内底部区布局（自底向上分层，单一事实源；面板高度与绘制共用，防两处漂移）──
 //   准备/开始/离开 H-58 (h28) → 分享按钮 H-94 (h28) → 房间方向 H-128 (h26) → URL H-138 → 标题 H-154
@@ -1271,10 +1294,11 @@ function renderOnline(W: number, H: number): void {
     renderer.ctx.fillStyle = stateColor;
     renderer.ctx.fillText(`座位 ${seats}/4  准备 ${readyTxt}/4  ${t.state === "playing" ? "对局中" : empty ? "空桌" : "等待中"}`, 26, ly + 27);
     renderer.ctx.restore();
-    // 命中区严格等于可视行矩形（ly..ly+ROW_H），且只在视口内注册 → 不会覆盖到按钮上
+    // v2.38 房间行**不再注册为 lobbyButtons**：点击由列表手势统一结算（pointerdown 记手势 →
+    //   pointerup 未拖动则 onlineJoin）。这样"房间行"与"按钮"两套命中区彻底分离，不可能互相抢占；
+    //   这里只登记本帧可视行（供 e2e/调试断言"列表过滤与滚动真的生效"）。
     if (!onlineInTable && ly >= LIST_TOP && ly + ROW_H <= listBottom) {
       lobbyVisibleRows.push({ id: t.id, mode: t.mode, y: ly, h: ROW_H });
-      lobbyButtons.push({ x: 16, y: ly, w: listW, h: ROW_H, onTap: () => onlineJoin(t) });
     }
     ly += ROW_STEP;
   });
@@ -2105,6 +2129,8 @@ if (new URLSearchParams(location.search).has("debug")) {
     tableBottomLayout: () => onlineTableBottomLayout(currentLayout.canvasH),
     canvasSize: () => ({ w: currentLayout.canvasW, h: currentLayout.canvasH }),
     scrollLobby: (n: number) => { lobbyScroll = n; },
+    /** e2e：把选中行设到指定下标（配合 scrollLobby 做确定性键盘滚动断言） */
+    selectRoomRow: (n: number) => { onlineSel = Math.max(0, n); lastLobbySel = onlineSel; },
     notif: () => onlineMsg,
     serverLanIps: () => serverLanIps,
     state: () => ({ state, mode: onlineMode, inTable: onlineInTable, netConnected: net.connected }),
@@ -2113,11 +2139,30 @@ if (new URLSearchParams(location.search).has("debug")) {
       document.dispatchEvent(new KeyboardEvent("keyup", { code }));
     },
     click: (cx: number, cy: number) => {
+      // 完整一次点击：pointerdown + pointerup（列表行在手势抬手时结算，只按下不算点击）
+      // 坐标换算与真实 pointerdown 同一口径：逻辑坐标 → CSS（用逻辑尺寸，不用物理缓冲尺寸，
+      // 否则高 DPI 设备 dpr=2 时会差一倍）
       const c = canvas;
       const r = c.getBoundingClientRect();
-      const x = r.left + cx * (r.width / c.width);
-      const y = r.top + cy * (r.height / c.height);
+      const { w: lw, h: lh } = logicalCanvasSize(c);
+      const x = r.left + cx * (r.width / lw);
+      const y = r.top + cy * (r.height / lh);
       c.dispatchEvent(new PointerEvent("pointerdown", { clientX: x, clientY: y, bubbles: true }));
+      c.dispatchEvent(new PointerEvent("pointerup", { clientX: x, clientY: y, bubbles: true }));
+    },
+    /** e2e：列表拖拽滚动（按下 → 若干次 move → 抬手；抬手不触发进桌） */
+    drag: (cx: number, cy0: number, cy1: number) => {
+      const c = canvas;
+      const r = c.getBoundingClientRect();
+      const { w: lw, h: lh } = logicalCanvasSize(c);
+      const X = r.left + cx * (r.width / lw);
+      const Y = (cy: number) => r.top + cy * (r.height / lh);
+      c.dispatchEvent(new PointerEvent("pointerdown", { clientX: X, clientY: Y(cy0), bubbles: true }));
+      const steps = 6;
+      for (let i = 1; i <= steps; i++) {
+        c.dispatchEvent(new PointerEvent("pointermove", { clientX: X, clientY: Y(cy0 + (cy1 - cy0) * i / steps), bubbles: true }));
+      }
+      c.dispatchEvent(new PointerEvent("pointerup", { clientX: X, clientY: Y(cy1), bubbles: true }));
     },
     rawState: () => ({ menuSel }),
     getEndlessMode: () => endless,
