@@ -31,6 +31,13 @@
 #     连前面的 pkill 都不跑，stage 秒失败（143ms / code 2）。
 #     → 本文件所有阶段脚本统一用**块标量 `script: |`**（项间无 `&&` 拼接），
 #       且后台启动一律包进子 shell `( ... & )`，任何拼接语义下都不会出现尾随裸 `&`。
+#     ⚠ 反例（曾写进 Issue #3 的「修正示例」里，**照抄必挂，已实测失败**）：
+#         script: |
+#           nohup node server/index.mjs > /tmp/tank-server.log 2>&1 &
+#           sleep 2
+#       块标量下每行都是独立命令，`&` 只把 nohup 放后台并**立即**执行下一行；
+#       父 shell 退出时子进程收到 SIGHUP/SIGTERM → `code 143`，且日志里后续输出全丢。
+#       必须写成子 shell：`( nohup ... > log 2>&1 & echo $! > pid )`。
 #
 #   坑 2｜`pkill -f "<脚本里出现过的字符串>"` 会**杀掉自己**
 #     平台把整段脚本作为 `sh -c "<脚本文本>"` 执行，该 shell 的**命令行里就含脚本文本**；
@@ -96,62 +103,46 @@ $:
             echo "── 延迟实测（公网入口 + 本机回环基线）──"
             timeout 180 npm run net:tunnel -- --test || true
 
-# ── Issue/PR 里 @NPC 触发：起服务 + 自检 + 延迟报告，可复现 ──
-# 触发：在本仓库 Issue/PR 评论里 @CodeBuddy（npc 事件），本流水线自动跑一遍。
-# 脚本写法同上（块标量 + 子 shell 后台启动 + 不用 pkill -f），规避上面两个坑。
-issue.comment@npc:
-  - runner:
-      cpus: 4
-    docker:
-      image: node:20
-    env:
-      PORT: "3001"
-      HOST: "0.0.0.0"
-    stages:
-      - name: install-deps
-        script: npm ci
-      - name: build-dist
-        script: npm run build
-      - name: start-server-and-selfcheck
-        script: |
-          set -u
-          if curl -sf -o /dev/null --max-time 3 http://127.0.0.1:3001/healthz; then
-            echo "[start] 3001 已有健康服务，复用现有进程"
-          else
-            if [ -f /tmp/tank-server.pid ]; then
-              old=$(cat /tmp/tank-server.pid 2>/dev/null || true)
-              if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
-                kill "$old" 2>/dev/null || true
-                sleep 1
-              fi
-            fi
-            echo "[start] 启动服务器（0.0.0.0:3001）"
-            (nohup node server/index.mjs > /tmp/tank-server.log 2>&1 & echo $! > /tmp/tank-server.pid)
-            sleep 2
-          fi
-          echo "── 服务器启动日志 ──"
-          cat /tmp/tank-server.log 2>/dev/null || true
-          code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3001/ || true)
-          ws=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:3001/?room=1" || true)
-          echo "本机 3001 自检: / => $code, /?room=1 => $ws"
-          if [ "$code" = "200" ]; then
-            echo "本机 3001 就绪 OK"
-          else
-            echo "服务器未就绪"
-            exit 1
-          fi
-      - name: tunnel-latency-report
-        script: |
-          set -u
-          # 兜底：万一服务在阶段间被回收，先确保它在（复用同一套安全启动写法）
-          if ! curl -sf -o /dev/null --max-time 3 http://127.0.0.1:3001/healthz; then
-            (nohup node server/index.mjs > /tmp/tank-server.log 2>&1 & echo $! > /tmp/tank-server.pid)
-            sleep 2
-          fi
-          echo "── 服务身份 ──"
-          curl -s http://127.0.0.1:3001/__whoami || true
-          echo
-          curl -s http://127.0.0.1:3001/healthz || true
-          echo
-          echo "── 预览地址 + 实测延迟（--test 已含身份探测）──"
-          timeout 180 node scripts/net-tunnel.mjs --test || true
+  # ── Issue/PR 里 @NPC：**不要**在这里起服务器 / 测延迟（会拖死 NPC 任务，见下）──
+  #
+  # ❌ 已删除的历史写法（v4 及之前在这里挂过一段 `issue.comment@npc:`）：
+  #      - name: start-server-and-selfcheck
+  #        script: |
+  #          (nohup node server/index.mjs > /tmp/tank-server.log 2>&1 & echo $! > /tmp/tank-server.pid)
+  #          timeout 180 node scripts/net-tunnel.mjs --test || true
+  #
+  #   它本身语法没问题（挂进 `$` 是对的），问题是**语义错了**：`issue.comment@npc`
+  #   的流水线不只是给 NPC 一个跑测试的环境，它本身就是**那个 NPC 任务的执行载体**。
+  #   在这里起一个长驻 node 进程，等于把模型和它的任务一起塞进同一个容器的同一个 shell 会话里：
+  #     · 服务器常驻 → 该 stage 永不结束 → NPC 事件拿不到干净收尾；
+  #     · 子 shell 后台进程与 Agent 的每条 bash 命令共用同一进程组/同一会话，
+  #       一旦 Agent 自己的命令超时被平台杀，后台服务跟着一起没；
+  #     · 更要命的是它和 NPC 的 CLI/技能、WebSocket、以及同镜像里的其他常驻进程**抢同一套资源**
+  #       （node 事件循环 / fd / 内存 / 3001 端口 / 共享的 .probe 与 tests 环境），
+  #       表现为「任务越跑越慢 → 后到的请求也没人处理 → 最后整条流水线被平台掐掉」。
+  #   实测（本仓库自证，可复现）：`get-build-logs --event issue.comment@npc` 里标注 success
+  #   的构建 duration 从 49s 一路涨到 639s；而完整版（带 vscode 全流程 + 延迟实测）的
+  #   2 次跑到 2143s / 3308s。最长的一条 error 构建（cnb-iii-1k2q8er4i）duration=5849141ms
+  #   ≈ 1h37.5m，stage `npc go` 独占 5839738ms，报错为
+  #   `[LLM request error ...] Pipeline has been stopped, Agent aborted`：
+  #   不是"任务太长"，是 **Agent 被平台超时中止**（与用户观察的 1h36m 完全吻合）。
+  #
+  # ✅ 正确做法：
+  #     · NPC 事件流水线**只留给 NPC**：不要起长驻服务、不要跑长耗时压测/延迟实测；
+  #     · 想验证"服务器 + 联机 + 延迟"这类副作用，走**独立事件**：
+  #       - `vscode:`（云原生开发，本文件上方那段）：起服务 + 自检 + 延迟实测，专人专线；
+  #       - 或 `push` / `web_trigger:` 专门跑一条构建，产出物/日志当证据；
+  #     · 需要给 NPC 一份环境时，用 `services:` 声明配套服务（平台托管生命周期），
+  #       而**不是**在 stage 里 `nohup` 一个和 Agent 抢资源的进程。
+  #
+  # 触发说明：本项目 NPC 事件走**平台内置的 npc:go**（镜像 cnbcool/default-npc:latest），
+  # 不依赖本文件再声明 `issue.comment@npc`；本文件里的 `issue.comment@npc` 一旦存在，
+  # 平台会**额外**按这里的内容再跑一条 Pipeline（所以上面那段才成了"罪魁"）。
+  # 若后续确需定制 NPC 行为，正确骨架长这样（注意 stages 里只有 npc:go，没有起服务）：
+  #
+  #   issue.comment@npc:
+  #     - docker:
+  #         image: cnbcool/default-npc:latest
+  #       stages:
+  #         - name: npc go
+  #           type: npc:go
