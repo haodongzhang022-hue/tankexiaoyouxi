@@ -8,14 +8,15 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "online": "node server/index.mjs",
-    "test": "vitest run",
+    "test": "vitest run && npm run net:entry-test",
     "test:watch": "vitest",
     "test:debug": "vitest run --inspect-brk --no-file-parallelism",
     "dual": "node scripts/quick-dual-test.mjs",
     "host-ai": "node scripts/ai-host.mjs",
     "net:tunnel": "node scripts/net-tunnel.mjs",
     "net:latency": "node scripts/net-latency.mjs",
-    "deploy:server": "bash deploy/start-server.sh"
+    "deploy:server": "bash deploy/start-server.sh",
+    "net:entry-test": "node --test src/net/entry-match.test.mjs"
   },
   "dependencies": {
     "ws": "^8.21.0"

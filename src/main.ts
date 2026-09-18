@@ -14,7 +14,7 @@ import { NetClient } from "./net/NetClient";
 import { RtcPeer, ICE_SERVERS } from "./net/RtcPeer";
 import type { ServerCandidate } from "./net/NetClient";
 // ── net-sync-core 通用资产：成员端解码/延迟/重连全部由模块驱动 ──
-import { SyncCodec, LatencyTracker, ReconnectManager } from "../net-sync-core/core";
+import { SyncCodec, LatencyTracker, ReconnectManager, StableEntryManager, entryPathOf, parseStableEntry } from "../net-sync-core/core";
 import { TANK_SYNC_SCHEMA, stateToNetSnapshot } from "../net-sync-core/adapters/tank-adapter";
 import type { NetTable, MigratedMsg, CheckpointPlayer } from "./net/NetTypes";
 import { RemoteView } from "./ui/RemoteView";
@@ -149,6 +149,67 @@ const rejoinMgr = new ReconnectManager({
   setItem: (k, v) => { try { localStorage.setItem(k, v); } catch { /* 忽略 */ } },
   removeItem: (k) => { try { localStorage.removeItem(k); } catch { /* 忽略 */ } },
 }, "tank_rejoin_v1");
+// ── v3.0 稳定入口（本 Issue 的核心机制）────────────────────────────
+// 问题：临时地址会变（云原生环境重建换域名、隧道重开换域名、服务器换 IP），但玩家手里的链接是固定的。
+// 做法：服务器有内部 id（sid），链接形状 = <当前域名>/<sid>/join/<roomId>；
+//       服务器每次 welcome/pong 都会汇报「sid + 当前入口地址」，客户端据此：
+//         ① 自动匹配到最新地址（每次连接/重连都把稳定链接作为第一候选，服务器 302 到当前地址）；
+//         ② 刷新本地稳定链接（域名换了不用手动改，玩家复制出来的就是新域名 + 同一个 sid）。
+// 于是「变化的部分自动挂载到稳定之上」：只要服务器没重启，链接一直能用；
+//       中途断线/刷新也是走同一条链接（也许已经被 302 到新域名）自动回到同一批人同一房间。
+const entryMgr = new StableEntryManager({
+  getItem: (k) => { try { return localStorage.getItem(k); } catch { return null; } },
+  setItem: (k, v) => { try { localStorage.setItem(k, v); } catch { /* 忽略 */ } },
+  removeItem: (k) => { try { localStorage.removeItem(k); } catch { /* 忽略 */ } },
+}, "tank_stable_entry_v1");
+/** 当前稳定链接的站内路径（/<sid>/join/<roomId>）；没有 sid 时返回 null（退回普通寻址） */
+function stableEntryPath(roomId: number | null): string | null {
+  const sid = entryMgr.peek()?.sid ?? net.sid;
+  if (!sid) return null;
+  return entryPathOf(sid, roomId);
+}
+/**
+ * 稳定链接候选：优先同源（当前域名已被 302 到正确环境），其次服务器汇报的当前入口地址。
+ * ⚠ 之前这里用 `shared === entryUrl` 比「ws://…」与「https://…」，恒不成立（死分支）；
+ *   现在只比 host（协议归一后再比），语义清楚：手里的域名与服务器入口不同才多跳一次。
+ */
+function stableEntryCandidates(): string | null {
+  const room = onlineCurrent?.id ?? autoJoinRoom ?? null;
+  const path = stableEntryPath(room ?? null);
+  if (!path) return null;
+  const wsUrl = (origin: string) => `${origin.replace(/^http/i, "ws").replace(/\/+$/, "")}${path}`;
+  const sameOrigin = `${wsProto()}://${location.host}${path}`;
+  const entryUrl = net.entryUrl;
+  const here = `${wsProto()}://${location.host}`;
+  if (entryUrl && entryUrl.replace(/^http/i, "ws").replace(/\/+$/, "") !== here) return wsUrl(entryUrl);
+  return sameOrigin;
+}
+/** 服务器汇报新 sid/入口 → 自动滚动更新本地稳定链接（同一进程内 sid 不变，无需重新分享） */
+function onEntryReport(sid: string, url: string | null): void {
+  if (!sid) return;
+  const prev = entryMgr.peek();
+  const same = prev && prev.sid === sid;
+  if (!same) {
+    entryMgr.adopt(sid, url ?? undefined, onlineCurrent?.id ?? autoJoinRoom ?? null);
+    console.log(`[稳定入口] 已自动匹配服务器内部 id ${sid}${prev ? `（原 ${prev.sid}，环境已重建 → 请重新分享链接）` : ""}`);
+    if (prev) notifyOnline("服务器已重建，链接已自动更新，请重新分享给好友");
+  } else if (url) {
+    entryMgr.adopt(sid, url, onlineCurrent?.id ?? autoJoinRoom ?? null);
+  }
+  if (serverPublicOrigin && prev?.sid === sid) keepStableEntryForOrigin(serverPublicOrigin);
+}
+/**
+ * 服务器入口变化 → 稳定链接自动挂到新入口上。
+ * v3.0.2：接受**完整 origin**（http://203.0.113.9:3001 / https://game.example.com），
+ * 不再硬拼 `https://` —— IP 形态部署（无域名）也要能分享出可用链接（Issue #11 评审 🔴2）。
+ */
+function keepStableEntryForOrigin(origin: string | null): void {
+  const card = entryMgr.peek();
+  if (!card || !origin) return;
+  const clean = origin.trim().replace(/\/+$/, "");
+  if (!/^https?:\/\//i.test(clean)) return;
+  entryMgr.save({ ...card, url: `${clean}${entryPathOf(card.sid, card.roomId ?? null)}` });
+}
 function saveRejoinCard(tableId: number, token: string): void { rejoinMgr.save({ tableId, token }); }
 function peekRejoinCard(): { tableId: number; token: string } | null { return rejoinMgr.peek(); }
 function clearRejoinCard(): void { rejoinMgr.clear(); }
@@ -179,7 +240,10 @@ function tryStartP2P(start: { myIndex: number; players: Array<{ clientId: number
   } catch { return null; }
 }
 let serverLanIps: string[] = [];   // 服务器在 welcome 里报告的本机局域网 IP（生成邀请链接用）
-let serverPublicHost: string | null = null; // 服务器动态学习的公网隧道域名（自动适配，勿写死）
+// 服务器**可信来源**确立的当前入口（v3.0.1：不再从进站 Host 学习，Host 可伪造）
+// v3.0.2：host 与**完整 origin** 都留一份 —— 域名形态用 https，IP 形态必须带协议+端口
+let serverPublicHost: string | null = null;
+let serverPublicOrigin: string | null = null;
 let onlineName = localStorage.getItem("tank_online_name") || "玩家";
 let onlineTables: NetTable[] = [];
 // v2.25 是否已收到过服务器桌子列表：未同步前不自动建房（避免连接时序空窗误建重复房）
@@ -258,6 +322,11 @@ function getServerCandidates(): ServerCandidate[] {
     return [u];
   }
   const cands: ServerCandidate[] = [`${wsProto()}://${location.host}`];
+  // 手里有「稳定入口」（/<sid>/join/… 形态）时，把它也作为兜底候选：
+  // 链接被 302/反代送到一个连不上的地址时，直接改连服务器本身，由它把我带回当前入口。
+  // 玩家视角：不用懂这些，打开链接就是能玩（Issue #11）。
+  const stablePath = stableEntryPath(autoJoinRoom ?? null);
+  if (stablePath) cands.push(`${wsProto()}://${location.host}${stablePath}`);
   if (location.port !== "3001") {
     cands.push(() => {
       const h = sharedHost || location.hostname;
@@ -285,6 +354,24 @@ function describeServer(): string {
 // 房间号解析/链接生成的纯逻辑在 src/net/InviteLink.ts（有单测锁行为，勿在本文件重写一份）。
 /** 待加入的邀请房间（连上服务器后消费一次）。null = 本次进大厅，不自动坐桌。 */
 let autoJoinRoom: number | null = parseInviteRoom(location.search);
+
+// ── v3.0 稳定入口自动学习：链接形如 /<sid>/join/<roomId>（302 后到达页面，路径仍可解析）──
+// 页面地址 / 当前域名 里只要带得出 sid，就记下来 —— 之后无论是断线重连、刷新、
+// 还是把链接再分享给别人，都能自动匹配到「当前实际地址」。
+(function learnStableEntryFromUrl() {
+  const fromPath = parseStableEntry(location.href);
+  if (fromPath) {
+    const prev = entryMgr.peek();
+    entryMgr.save({ sid: fromPath.sid, roomId: fromPath.roomId ?? autoJoinRoom ?? prev?.roomId ?? null, url: location.origin });
+    // 302 落回来时路径可能已被换成 "/?room=x"，此时 roomId 从 query 里补
+    if (autoJoinRoom != null) entryMgr.save({ sid: fromPath.sid, roomId: autoJoinRoom, url: location.origin });
+    console.log(`[稳定入口] 从链接学习到 sid=${fromPath.sid} room=${fromPath.roomId ?? autoJoinRoom ?? "-"}`);
+  }
+  // 另一个可能：管理员直接改地址栏（?entry=<sid>）或先用老链接（?room=x），都允许后续由 welcome 补 sid
+  const qs = new URLSearchParams(location.search);
+  const entrySid = (qs.get("entry") || "").trim().toLowerCase();
+  if (/^[0-9a-f]{8}$/.test(entrySid)) entryMgr.save({ sid: entrySid, roomId: autoJoinRoom, url: location.origin });
+})();
 
 /** v2.10 快照增量解码器（成员端把增量帧重建为完整快照再喂 RemoteView）——net-sync-core SyncCodec */
 const snapCodec = new SyncCodec(TANK_SYNC_SCHEMA);
@@ -321,68 +408,117 @@ function getSharedHost(): string {
   if (lan) { sharedHost = lan; sharedHostAt = Date.now(); return lan; }
   return h;
 }
-/** 公网隧道域名（localStorage 记忆；配置/自动学习均可设置） */
-function getPublicHost() {
+/** 手动配置/记忆的公网入口（localStorage；U 键可改）。原样保存，协议与端口都不丢。 */
+function getPublicOrigin(): string | null {
   try {
-    const v = localStorage.getItem("tank_public_host");
+    const v = (localStorage.getItem("tank_public_host") || "").trim();
     if (!v) return null;
-    return v.trim().replace(/^https?:\/\//, "").replace(/[\/].*$/, "").replace(/:\d+$/, "");
+    const clean = v.replace(/[\/]+$/, "");
+    if (/^https?:\/\//i.test(clean)) return clean;              // 用户/自动学习时带了协议 → 原样用
+    // 只有 host[:port]：域名默认 https，IP（含端口）默认 http —— 后者是 IP 形态部署的常见姿势
+    return `${/^\d+\.\d+\.\d+\.\d+/.test(clean) ? "http" : "https"}://${clean}`;
   } catch { return null; }
+}
+/** 手动配置/记忆的公网 host（展示用；保留端口） */
+function getPublicHost(): string | null {
+  const o = getPublicOrigin();
+  return o ? o.replace(/^https?:\/\//i, "") : null;
 }
 function setPublicHost(h: string | null) {
   try {
-    if (h) localStorage.setItem("tank_public_host", h.trim().replace(/^https?:\/\//, "").replace(/[\/].*$/, ""));
+    if (h) localStorage.setItem("tank_public_host", h.trim().replace(/[\/]+$/, ""));
     else localStorage.removeItem("tank_public_host");
   } catch {}
 }
-/** 页面通过公网隧道域名打开时自动记住（桌面端分享时也用它） */
+/**
+ * 页面通过**公网地址**打开时自动记住它（桌面端分享时也用它）。
+ * v3.0.2：公网 IP 形态也记（含端口），且把协议一起记住（http://203.0.113.9:3001 不能拼成 https）。
+ * 局域网 IP / 回环仍不记（好友设备上无意义）。
+ */
 function autoLearnPublicHost() {
   try {
     const h = location.hostname;
     if (!h || h === "localhost" || h === "127.0.0.1" || h === "0.0.0.0") return;
-    if (/^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h)) return; // 局域网不记
-    setPublicHost(h);
+    const isLan = /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h);
+    if (isLan) return;                                    // 局域网地址不记（只对同一 WiFi 有意义）
+    setPublicHost(`${location.protocol}//${location.host}`);
   } catch {}
 }
 
 
 /**
- * 生成「带房间号」的邀请链接：好友打开后自动坐到本桌座位上（不带房间号则进大厅）。
- * 关键规则：
- *  ① 链接里绝不能出现 localhost / 127.0.0.1 —— 那在好友设备上指向他自己；
- *  ② 房间号 = 服务器桌号（与大厅列表里的桌 ID 一致，稳定不变）；
- *  ③ 房间号拼接用 InviteLink.buildInviteUrl（纯逻辑 + 单测），别在这里手写字符串。
+ * 可分享的「当前入口 origin」：服务器可信来源确立的入口 > 页面自身域名（排除 localhost）；没有则 ""。
+ * v3.0.2：优先用服务器给的**完整 origin**（协议+端口都在里面），这样
+ *   域名（https://game.example.com）、公网 IP（http://203.0.113.9:3001）、
+ *   局域网 IP（http://192.168.1.50:3001）三种形态都能原样分享出去。
  */
-function shareBase(): { base: string; extra: string } {
-  // ① 服务器动态学习的公网入口域名（隧道/端口预览/反向代理变化都自动适配，最优先）
-  if (serverPublicHost) return { base: `https://${serverPublicHost}/`, extra: "" };
-  // ② 手动配置/记忆的公网域名（兜底）
-  const pub = getPublicHost();
-  if (pub) return { base: `https://${pub}/`, extra: "" };
+function getSharedOrigin(): string {
+  const pub = serverPublicOrigin || (serverPublicHost ? `https://${serverPublicHost}` : "");
+  if (pub && /^https?:\/\//i.test(pub) && !/^https?:\/\/(localhost|127\.)/i.test(pub)) return pub.replace(/\/+$/, "");
+  const h = location.hostname;
+  if (!h || h === "localhost" || h === "127.0.0.1" || h === "0.0.0.0") return "";
+  return location.origin;
+}
+
+/**
+ * 邀请链接**基址**（协议 + 主机 + 路径；拼房号一律交给 InviteLink 纯逻辑，本文件不手写字符串）。
+ *
+ * v2.39 合并 main：**先走 main 的稳定入口优先链**，再叠加本 PR 的 InviteLink 房号绑定：
+ *   ⓿ 稳定入口路径 `/<sid>/join/<roomId>` —— 域名/IP 变了由服务器 302 自动匹配，链接不用改；
+ *      （这是 Issue #11 的成果，合并时**必须保留**：房号在路径里，roomInPath=true）
+ *   ① 服务器可信来源确立的**完整 origin**（协议+端口都保留）——IP 形态不会被硬拼成 https；
+ *   ② 服务器汇报的入口 host（仅作 ① 缺席时的兜底）；
+ *   ③ 手动配置/自动记忆的公网入口（协议原样，IP 形态同样不打成 https）；
+ *   ④ 页面自身地址 / 局域网地址兜底（localhost 打开时用服务器报告的局域网 IP）。
+ *
+ * @param roomId 目标桌号（null = 大厅链接：稳定入口形态下即 `/<sid>/join/`，好友进大厅）
+ * @returns base=基址；extra=额外入口参数（如 server=…）；roomInPath=房号已在 base 路径里（调用方勿再拼 ?room=）
+ */
+function shareBase(roomId: number | null): { base: string; extra: string; roomInPath: boolean } {
+  const noRoom = { extra: "", roomInPath: false } as const;
+  // ⓿ 稳定入口：链接形状 = <当前实际域名>/<sid>/join/<roomId>。
+  //    域名用「服务器可信来源确立的入口」> 页面自身域名（都不是 caller 自报，防 Host 伪造劫持）。
+  const entryPath = stableEntryPath(roomId);
+  if (entryPath) {
+    const origin = getSharedOrigin();
+    if (origin) return { base: `${origin}${entryPath}`, extra: "", roomInPath: true };
+    // 本机打开（localhost）：退回服务器的局域网 IP，同样带稳定入口路径（仅同 WiFi 可用）
+    const lan = serverLanIps[0] || sharedHost;
+    if (lan) return { base: `http://${lan}:${location.port || 3001}${entryPath}`, extra: "", roomInPath: true };
+  }
+  // ① 服务器可信来源确立的当前入口（域名/IP 都算，客户端由 welcome/pong 自动刷新）
+  if (serverPublicOrigin) return { base: `${serverPublicOrigin.replace(/\/+$/, "")}/`, ...noRoom };
+  if (serverPublicHost) return { base: `https://${serverPublicHost.replace(/\/+$/, "")}/`, ...noRoom };
+  // ② 手动配置/记忆的公网入口（兜底）：协议按用户/自动学习时给的原样，IP 形态不会被打成 https
+  const pub = getPublicOrigin();
+  if (pub) return { base: `${pub.replace(/\/+$/, "")}/`, ...noRoom };
 
   const h = location.hostname;
   const isLocal = !h || h === "localhost" || h === "127.0.0.1";
-  if (!isLocal) return { base: `${location.origin}${location.pathname}`, extra: "" };
+  if (!isLocal) return { base: `${location.origin}${location.pathname}`, ...noRoom };
 
   // 开发模式（Vite 等非 3001 页面）：额外携带 ?server= 指向联机服
   if (location.port && location.port !== "3001") {
     const host = serverLanIps[0] || sharedHost;
-    if (!host) return { base: "", extra: "" };
+    if (!host) return { base: "", ...noRoom };
     const server = encodeURIComponent(`${wsProto()}://${host}:3001`);
-    return { base: `http://${host}:3001${location.pathname}`, extra: `server=${server}` };
+    return { base: `http://${host}:3001${location.pathname}`, extra: `server=${server}`, roomInPath: false };
   }
   // 单端口部署 + localhost 打开：替换为服务器的局域网地址（仅同 WiFi 可用）
   const host = serverLanIps[0];
-  if (host) return { base: `http://${host}:${location.port || 3001}${location.pathname}`, extra: "" };
-  return { base: "", extra: "" }; // 拿不到任何可分享地址（无局域网网卡），由调用方提示
+  if (host) return { base: `http://${host}:${location.port || 3001}${location.pathname}`, ...noRoom };
+  return { base: "", ...noRoom }; // 拿不到任何可分享地址（无局域网网卡），由调用方提示
 }
 
-/** 生成「带房间号」邀请链接（入口地址 + 房号；纯逻辑拼接见 InviteLink.buildInviteUrl）。 */
+/** 生成「带房间号」邀请链接（好友打开后自动坐到本桌座位上；纯逻辑拼接见 InviteLink.buildInviteUrl）。 */
 function buildInviteUrl(roomId: number): string {
-  const { base, extra } = shareBase();
+  const { base, extra, roomInPath } = shareBase(roomId);
   if (!base) return "";
+  // 稳定入口形态：房号已在路径 /<sid>/join/<roomId> 里，不再拼 ?room=（保持 Issue #11 的链接形状）
+  if (roomInPath) return base;
   return buildInviteUrlPure(base, roomId, extra);
 }
+
 
 /**
  * 不带房间号的「大厅链接」：好友打开后进大厅，自己选桌/开房（不占座位）。
@@ -390,7 +526,7 @@ function buildInviteUrl(roomId: number): string {
  * "room=0 非法"这条未声明的隐式契约，且会先生成一条非法房号链接）。
  */
 function buildLobbyUrl(): string {
-  const { base, extra } = shareBase();
+  const { base, extra } = shareBase(null);
   if (!base) return "";
   return buildLobbyUrlPure(base, extra);
 }
@@ -734,7 +870,8 @@ function enterOnline(): void {
   onlineInTable = false;
   onlineCurrent = null;
   onlineSel = 0;
-  notifyOnline("正在连接联机服务器…");
+  const stable = entryMgr.peek();
+  notifyOnline(stable ? "正在连接联机服务器（稳定入口自动匹配中…）" : "正在连接联机服务器…");
 }
 
 function exitOnlineToMenu(): void {
@@ -800,21 +937,108 @@ function scheduleInviteJoinRetry(): void {
   }, INVITE_JOIN_RETRY_MS);
 }
 
+/**
+ * v3.0.3 入口自愈：当前页面地址 != 服务器汇报的当前入口时，把浏览器带到正确入口
+ * （带上 sid + 房间号 → 到达后仍是同一个房间，稳定链接语义不变）。
+ * 只在「服务器有明确入口」且「当前页面不是这个入口」且「当前不是由 ?server= 指定服务器」时才跳，
+ * 避免多服务器/开发模式被误跳。
+ */
+async function reconcileEntryOrigin(): Promise<void> {
+  const target = serverPublicOrigin ? serverPublicOrigin.replace(/\/+$/, "") : "";
+  if (!target || !/^https?:\/\//i.test(target)) return;
+  // 只在**页面被送到了别的地址**时自愈（反代/隧道/后端网络把用户送到了非本服务的地址）。
+  // 同机打开（localhost / 本机网卡 IP 访问同一台服务器）属于房主自己开着玩，绝不跳 ——
+  // 跳了反而会把房主从他自己的页面踢走（体验倒退）。
+  const sameHost = location.hostname === new URL(target).hostname;
+  const isLocalView = /^(localhost|127\.|0\.0\.0\.0)$/i.test(location.hostname);
+  if (sameHost || isLocalView) return;
+  const qs = new URLSearchParams(location.search);
+  if (qs.get("server")) return;                                  // 显式指定别的服务器 → 不跳
+  if (location.origin === target) return;                        // 已经在正确入口上
+  const sid = net.sid;
+  if (!sid) return;
+  // 服务器可达性先确认一下：新入口打不开（如仅内网可达）就不跳，免得把玩家推到更差的地址
+  try {
+    const ac = new AbortController();
+    const to = setTimeout(() => ac.abort(), 2500);
+    const r = await fetch(`${target}/__whoami`, { signal: ac.signal, cache: "no-store" });
+    clearTimeout(to);
+    if (!r.ok) return;
+    const j = await r.json().catch(() => null);
+    if (!j || j.sid !== sid) return;                             // 别跳到另一台服务器上
+  } catch { return; }
+  const room = onlineCurrent?.id ?? autoJoinRoom ?? entryMgr.peek()?.roomId ?? null;
+  const url = `${target}/${sid}/join/${room != null ? room : ""}`;
+  console.log(`[稳定入口] 当前页面入口( ${location.origin} )与服务器入口( ${target} )不一致，自动带你过去`);
+  notifyOnline("正在带你到正确的服务器入口…");
+  location.replace(url);
+}
+
+/**
+ * v3.0.3「玩家视角」：服务器登记的入口**从我这台机器连不上**时的自救。
+ *
+ * 场上真实故障（Issue #11 用户描述）：服务器对外登记的入口（公网 IP/域名）在后端网络里访问不到 ——
+ * 页面能打开（说明这个地址是通的），但任何指向「那个入口」的链接、跳转、分享都等于把玩家送进死路。
+ * 玩家要的是「点开就能玩」，不是「先去验证入口可达性」。
+ *
+ * 所以：一旦发现入口连不上，就把「我实际打开的这个地址」当作可用入口用起来 ——
+ *   ① 本地稳定入口落成当前地址（断线重连/刷新继续走它，不再绕远路去不可达的入口）；
+ *   ② 告诉服务器「这台机器从哪个地址能连到你」（仅在其**已经登记过入口**时用于修正，
+ *      未登记时不动：避免把「请求方自报的 Host」重新引回来当入口，那是之前的钓鱼漏洞）。
+ */
+async function ensureLocalPlayableEntry(): Promise<void> {
+  const target = serverPublicOrigin ? serverPublicOrigin.replace(/\/+$/, "") : "";
+  const sid = net.sid;
+  if (!sid) return;
+  const origin = location.origin;
+  if (/^https?:\/\//i.test(target) && target !== origin) {
+    let reachable = false;
+    try {
+      const ac = new AbortController();
+      const to = setTimeout(() => ac.abort(), 2500);
+      const r = await fetch(`${target}/__whoami`, { signal: ac.signal, cache: "no-store" });
+      clearTimeout(to);
+      reachable = r.ok;
+    } catch { reachable = false; }
+    if (reachable) return;                                       // 入口可达：保持现状，不必自救
+    console.log(`[稳定入口] 登记的入口 ${target} 从本机连不上 → 就地使用当前地址 ${origin}`);
+    notifyOnline("当前网络连不上服务器登记的入口，已就地用你打开的这个地址开玩");
+  }
+  // ① 本地稳定入口 = 当前实际可用的地址（玩家刷新/断线重连走它）
+  entryMgr.save({ sid, roomId: onlineCurrent?.id ?? autoJoinRoom ?? entryMgr.peek()?.roomId ?? null, url: origin });
+  // ② 服务器已登记过入口 → 允许它按「这台机器实际能连到的地址」修正一次（仅此情形，避免请求方自报 Host 复活）
+  try {
+    await fetch("/entry/localtip?origin=" + encodeURIComponent(origin), { cache: "no-store" });
+  } catch { /* 失败不影响开玩 */ }
+}
+
 function wireNetHandlers(): void {
+  net.setEntryLink(() => stableEntryCandidates());   // 稳定链接永远是第一寻址候选（自动匹配）
+  net.on("entry", (e) => onEntryReport(e.sid, e.url));
   net.on("tables", (tables) => {
     onlineTables = tables;
     tablesSynced = true;   // v2.25 已同步：允许"快速加入/开房"直接决策
-    // 服务器每次广播都带最新公网域名 → 邀请链接实时自动适配
+    // 服务器每次广播都带最新公网域名（来自可信来源）→ 邀请链接实时自动适配（稳定链接同步换域名）
     if (net.publicHost) serverPublicHost = net.publicHost;
+    if (net.publicOrigin) { serverPublicOrigin = net.publicOrigin; keepStableEntryForOrigin(net.publicOrigin); }
   });
   net.on("welcome", () => {
     // 记录服务器报告的真实局域网地址（生成邀请链接用）
     const si = net.serverInfo;
     if (si && si.lanIps.length) serverLanIps = si.lanIps;
-    // 服务器动态学习的公网隧道域名（隧道重启/域名变化时自动更新，无需手动配置）
+    // 服务器可信来源确立的当前入口（隧道/换 IP 后由登记刷新，客户端自动跟上）
     if (net.publicHost) serverPublicHost = net.publicHost;
+    if (net.publicOrigin) { serverPublicOrigin = net.publicOrigin; keepStableEntryForOrigin(net.publicOrigin); }
     // 页面经公网隧道打开 → 自动记住该域名（兜底：本地手动模式）
     autoLearnPublicHost();
+    // v3.0.3「玩家视角」自愈：这条页面如果不是从服务器自己的入口打开的（反代/隧道把用户送到了
+    // 别的地址，页面与 WebSocket 不同源），服务器已经告诉了我们正确入口 —— 自动带过去，
+    // 玩家不需要理解「入口 / 反代 / 域名」是什么，打开链接就是能玩（Issue #11）。
+    // 放在 welcome 之后一小段延迟：welcome 里刚拿到的入口要先落到 serverPublicOrigin，
+    // 而 welcome 只保证「有地址」，不保证「页面已经被送到那个地址」（反代/多跳场景）。
+    setTimeout(() => { void reconcileEntryOrigin(); }, 600);
+    // 反向场景：登记的入口从本机根本连不上（后端网络不通）→ 就地用当前地址开玩，别让玩家卡住
+    setTimeout(() => { void ensureLocalPlayableEntry(); }, 1400);
     // v2.19 连接后主动拉取桌子列表（不依赖服务器广播时序，避免大厅空表）
     net.list();
     // 带邀请链接打开：连上后自动加入目标房间（重连卡优先于邀请链接，避免已开始的对局被 join 拒绝）
@@ -1068,8 +1292,9 @@ function handleOnline(dt: number): void {
     if (input.wasJustPressed("KeyT") && onlineIsHost()) { onlineToggleOrient(); return; }
     if (input.wasJustPressed("KeyU") && onlineCurrent) {
       const cur = getPublicHost() ?? "";
-      const nn = prompt("设置公网隧道域名（如 27201307.r29.cpolar.top），留空清除：", cur);
-      if (nn !== null) { setPublicHost(nn.trim() || null); notifyOnline(nn.trim() ? "公网域名已设置，邀请链接将用公网地址" : "已清除公网域名"); }
+      // v3.0.2：公网 **IP（带端口）** 也能填 —— 无域名的部署形态靠它分享（如 203.0.113.9:3001）
+      const nn = prompt("设置公网入口（域名如 27201307.r29.cpolar.top，或 IP:端口如 203.0.113.9:3001），留空清除：", cur);
+      if (nn !== null) { setPublicHost(nn.trim() || null); notifyOnline(nn.trim() ? "公网入口已设置，邀请链接将用它" : "已清除公网入口"); }
       return;
     }
   }
@@ -1245,7 +1470,8 @@ function renderOnline(W: number, H: number): void {
   renderer.ctx.fillText(`房间列表（${filtered.length} 桌）${rangeTxt}:`, 20, ly);
   renderer.ctx.restore();
   ly += 18;
-  const listW = Math.max(300, Math.floor(W * 0.5));
+  // v2.39 🟡2 收口：列表宽用 lobbyListGeom 的单一事实源（渲染/命中/滚动同源），不再本处重算一遍
+  const listW = geo.listW;
   if (filtered.length === 0) {
     renderer.ctx.save();
     renderer.ctx.font = "13px monospace";
@@ -1592,7 +1818,8 @@ function renderOnline(W: number, H: number): void {
     renderer.ctx.textAlign = "center";
     renderer.ctx.fillText(onlineIsHost() ? "点「开始」开局（其他人需已准备）" : "点「准备」后等待房主开始", px + panelW / 2, hintY);
     renderer.ctx.fillStyle = "#4a9eff";
-    renderer.ctx.fillText("Y 复制邀请链接（含房间号） / U 设置公网域名 / T 房间方向（房主）", px + panelW / 2, hintY + 14);
+
+    renderer.ctx.fillText("Y 复制邀请链接（含房间号） / U 设置公网入口（域名或 IP:端口） / T 房间方向（房主）", px + panelW / 2, hintY + 14);
     renderer.ctx.fillStyle = "#7cff7c";
     renderer.ctx.fillText(`本桌房间号 #${onlineCurrent.id}（邀请链接带此号 = 好友直接坐进来）`, px + panelW / 2, hintY + 28);
     renderer.ctx.restore();
@@ -1610,15 +1837,15 @@ function renderOnline(W: number, H: number): void {
     const maxChars = Math.max(24, Math.floor(W / 7.2));
     const shown = url
       ? (url.length > maxChars ? url.slice(0, maxChars) + "…" : url)
-      : "（未配置公网域名且无局域网地址，按 U 设置公网域名）";
-    const isPub = !!serverPublicHost || !!getPublicHost();
+      : "（未配置公网入口且无局域网地址，按 U 设置公网入口）";
+    const isPub = !!serverPublicOrigin || !!serverPublicHost || !!getPublicOrigin();
     renderer.ctx.save();
     renderer.ctx.font = "11px monospace";
     renderer.ctx.fillStyle = isPub ? "#8fff8f" : "#ffaa00";
     renderer.ctx.textAlign = "center";
     renderer.ctx.fillText(isPub
-      ? `邀请链接 · 带房间号 #${onlineCurrent.id} · 公网（好友打开直接坐进本桌）：`
-      : `邀请链接 · 带房间号 #${onlineCurrent.id} · 局域网（仅同 WiFi，服务器学到公网域名后自动切换）：`,
+      ? `邀请链接 · 稳定入口 · 房间号 #${onlineCurrent.id}（换域名/换 IP 自动匹配，好友打开直接坐进本桌）：`
+      : `邀请链接 · 稳定入口 · 房间号 #${onlineCurrent.id} · 局域网（仅同 WiFi；服务器有公网入口后自动切换）：`,
       W / 2, titleTextY);
     renderer.ctx.fillStyle = "#66ccff";
     renderer.ctx.fillText(shown, W / 2, urlTextY);

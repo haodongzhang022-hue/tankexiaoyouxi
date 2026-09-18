@@ -21,6 +21,20 @@
 # 注意：
 #   - 服务必须监听 0.0.0.0（server/index.mjs 默认如此），只听 127.0.0.1 预览代理回源不到；
 #   - 本文件必须在**目标分支自身**存在，否则该分支的「云原生开发」起不来；
+#   - 【稳定链接 v3.0】服务器启动后会打印「稳定链接」`<当前域名>/<sid>/join/<房间号>`：
+#     域名/IP 变了由服务器 302 自动匹配，链接不用改；同一进程内 sid 恒定，重启/环境重建才换新。
+#     自测：npm run net:entry-test（16/16；已接入门禁 —— vscode 与 issue 两条流水线都跑）
+#   - 【入口只信可信来源 v3.0.2】「当前入口」**不采信进站请求的 Host**（Host 可伪造，会被劫持成钓鱼链接）。
+#     优先级：① 带一次性令牌的**显式登记**（GET /entry/register?url=<IP 或域名>，令牌在
+#     $TANK_ENTRY_TOKEN_FILE，默认 /tmp/tank-entry-<port>.token，0600；登记结果落盘 .url，重启后仍在）
+#     → ② 平台预览模板（经同口径校验，含残留占位符一律作废）→ ③ 保持现有入口。
+#     **IP 形态部署（无域名）同样可登记**：http://203.0.113.9:3001 / http://192.168.1.50:3001 都能当入口；
+#     没有任何入口时给可操作提示页，**绝不**把好友 302 到 127.0.0.1（那会指向他自己机器）。
+#     换域名/换 IP 后跑一次 `npm run net:tunnel -- --entry=http://<新地址>:3001` 即可（deploy/start-server.sh 已内置）。
+#   - 【玩家开箱可玩 v3.0.3】入口**不需要任何手动前置**：服务器启动时自己找一次（TANK_PUBLIC_ENTRY →
+#     本机公网出口 IP → 局域网 IP）并落盘，打开就玩；显式令牌登记优先级仍最高。TANK_AUTO_ENTRY=0 可关。
+#     玩家侧若发现登记入口连不上（后端网络不通），会就地用实际能连到的地址开玩并修正一次（/entry/localtip，
+#     **仅在已有登记入口时**，避免请求方自报 Host 重新变成入口）。自测：npm run net:entry-test（22/22）。
 #   - 这里的 stages 只装依赖/构建/起服务/自测，不要占用 3001，避免与服务器抢端口。
 #
 # ⚠⚠ 阶段脚本两个「真机踩过」的坑（改本文件前必读，勿回退）：
@@ -31,6 +45,13 @@
 #     连前面的 pkill 都不跑，stage 秒失败（143ms / code 2）。
 #     → 本文件所有阶段脚本统一用**块标量 `script: |`**（项间无 `&&` 拼接），
 #       且后台启动一律包进子 shell `( ... & )`，任何拼接语义下都不会出现尾随裸 `&`。
+#     ⚠ 反例（曾写进 Issue #3 的「修正示例」里，**照抄必挂，已实测失败**）：
+#         script: |
+#           nohup node server/index.mjs > /tmp/tank-server.log 2>&1 &
+#           sleep 2
+#       块标量下每行都是独立命令，`&` 只把 nohup 放后台并**立即**执行下一行；
+#       父 shell 退出时子进程收到 SIGHUP/SIGTERM → `code 143`，且日志里后续输出全丢。
+#       必须写成子 shell：`( nohup ... > log 2>&1 & echo $! > pid )`。
 #
 #   坑 2｜`pkill -f "<脚本里出现过的字符串>"` 会**杀掉自己**
 #     平台把整段脚本作为 `sh -c "<脚本文本>"` 执行，该 shell 的**命令行里就含脚本文本**；
@@ -55,6 +76,11 @@ $:
           script: npm ci
         - name: build-dist
           script: npm run build
+        - name: stable-entry-regression
+          # 稳定入口回归锁（Issue #11 评审 🟡2：不进门禁的锁必腐）。
+          # 真起服务器 + 真发 HTTP，覆盖：IP 形态登记 → 302 到该 IP、伪造 Host 不得改写入口、
+          # 模板残留占位符不得成为入口、显式登记优先级、令牌 0600 + 不跟随符号链接。
+          script: npm run net:entry-test
         - name: start-tank-server
           # 块标量单条脚本：无 `&&` 拼接、后台启动在子 shell 里、不 pkill 自匹配。
           script: |
@@ -112,6 +138,9 @@ issue.comment@npc:
         script: npm ci
       - name: build-dist
         script: npm run build
+      - name: stable-entry-regression
+        # 稳定入口回归锁：纯 node --test（自起服务器、自选随机端口，不占用 3001）
+        script: npm run net:entry-test
       - name: start-server-and-selfcheck
         script: |
           set -u
@@ -155,3 +184,47 @@ issue.comment@npc:
           echo
           echo "── 预览地址 + 实测延迟（--test 已含身份探测）──"
           timeout 180 node scripts/net-tunnel.mjs --test || true
+
+  # ── Issue/PR 里 @NPC：**不要**在这里起服务器 / 测延迟（会拖死 NPC 任务，见下）──
+  #
+  # ❌ 已删除的历史写法（v4 及之前在这里挂过一段 `issue.comment@npc:`）：
+  #      - name: start-server-and-selfcheck
+  #        script: |
+  #          (nohup node server/index.mjs > /tmp/tank-server.log 2>&1 & echo $! > /tmp/tank-server.pid)
+  #          timeout 180 node scripts/net-tunnel.mjs --test || true
+  #
+  #   它本身语法没问题（挂进 `$` 是对的），问题是**语义错了**：`issue.comment@npc`
+  #   的流水线不只是给 NPC 一个跑测试的环境，它本身就是**那个 NPC 任务的执行载体**。
+  #   在这里起一个长驻 node 进程，等于把模型和它的任务一起塞进同一个容器的同一个 shell 会话里：
+  #     · 服务器常驻 → 该 stage 永不结束 → NPC 事件拿不到干净收尾；
+  #     · 子 shell 后台进程与 Agent 的每条 bash 命令共用同一进程组/同一会话，
+  #       一旦 Agent 自己的命令超时被平台杀，后台服务跟着一起没；
+  #     · 更要命的是它和 NPC 的 CLI/技能、WebSocket、以及同镜像里的其他常驻进程**抢同一套资源**
+  #       （node 事件循环 / fd / 内存 / 3001 端口 / 共享的 .probe 与 tests 环境），
+  #       表现为「任务越跑越慢 → 后到的请求也没人处理 → 最后整条流水线被平台掐掉」。
+  #   实测（本仓库自证，可复现）：`get-build-logs --event issue.comment@npc` 里标注 success
+  #   的构建 duration 从 49s 一路涨到 639s；而完整版（带 vscode 全流程 + 延迟实测）的
+  #   2 次跑到 2143s / 3308s。最长的一条 error 构建（cnb-iii-1k2q8er4i）duration=5849141ms
+  #   ≈ 1h37.5m，stage `npc go` 独占 5839738ms，报错为
+  #   `[LLM request error ...] Pipeline has been stopped, Agent aborted`：
+  #   不是"任务太长"，是 **Agent 被平台超时中止**（与用户观察的 1h36m 完全吻合）。
+  #
+  # ✅ 正确做法：
+  #     · NPC 事件流水线**只留给 NPC**：不要起长驻服务、不要跑长耗时压测/延迟实测；
+  #     · 想验证"服务器 + 联机 + 延迟"这类副作用，走**独立事件**：
+  #       - `vscode:`（云原生开发，本文件上方那段）：起服务 + 自检 + 延迟实测，专人专线；
+  #       - 或 `push` / `web_trigger:` 专门跑一条构建，产出物/日志当证据；
+  #     · 需要给 NPC 一份环境时，用 `services:` 声明配套服务（平台托管生命周期），
+  #       而**不是**在 stage 里 `nohup` 一个和 Agent 抢资源的进程。
+  #
+  # 触发说明：本项目 NPC 事件走**平台内置的 npc:go**（镜像 cnbcool/default-npc:latest），
+  # 不依赖本文件再声明 `issue.comment@npc`；本文件里的 `issue.comment@npc` 一旦存在，
+  # 平台会**额外**按这里的内容再跑一条 Pipeline（所以上面那段才成了"罪魁"）。
+  # 若后续确需定制 NPC 行为，正确骨架长这样（注意 stages 里只有 npc:go，没有起服务）：
+  #
+  #   issue.comment@npc:
+  #     - docker:
+  #         image: cnbcool/default-npc:latest
+  #       stages:
+  #         - name: npc go
+  #           type: npc:go

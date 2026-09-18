@@ -35,6 +35,8 @@ export interface NetEvents {
   error: (msg: string) => void;
   closed: () => void;
   left: () => void;
+  /** 服务器汇报「当前入口 + 内部 id」（welcome/pong 都会带）→ 客户端自动匹配刷新稳定链接 */
+  entry: (e: { sid: string; url: string | null }) => void;
 }
 
 type Handler = (...args: any[]) => void;
@@ -43,6 +45,16 @@ type Handler = (...args: any[]) => void;
 export type ServerCandidate = string | (() => string | null);
 
 const PROBE_TIMEOUT_MS = 3500; // 每个候选地址的最长探测时间
+
+/** ws/wss/http/https 混写都归一到 ws(s)://；保留路径（稳定入口 /<sid>/join/<room> 必须原样带上） */
+export function normalizeWsUrl(u: string): string {
+  const s = String(u || "").trim();
+  if (!s) return s;
+  if (/^wss?:/i.test(s)) return s;
+  if (/^https:/i.test(s)) return "wss:" + s.slice(6);
+  if (/^http:/i.test(s)) return "ws:" + s.slice(5);
+  return s;
+}
 
 export class NetClient {
   private ws: WebSocket | null = null;
@@ -55,7 +67,12 @@ export class NetClient {
   private _players: Array<{ clientId: number; name: string }> = [];
   private _seed = 0;
   private _serverInfo: ServerInfo | null = null;   // 服务器的真实局域网地址
-  private _publicHost: string | null = null;        // 服务器动态学习的当前公网隧道域名
+  private _publicHost: string | null = null;        // 服务器可信来源确立的当前入口 host（展示用）
+  private _publicOrigin: string | null = null;      // 同上，但带协议与端口（生成邀请链接用，IP 形态也能用）
+  private _sid: string | null = null;               // 服务器内部 id（稳定入口用；环境重建会换新）
+  private _entryUrl: string | null = null;          // 服务器汇报的「当前实际入口」地址（自动匹配源）
+  /** 稳定链接优先的候选（URL 对象，每次重连实时求值）→ 断线后自动跳到最新地址 */
+  private entryLink: (() => string | null) | null = null;
 
   // 多候选探测状态
   private candidates: ServerCandidate[] = [];
@@ -73,13 +90,27 @@ export class NetClient {
   get seed(): number { return this._seed; }
   /** 服务器在 welcome 里报告的局域网地址（可能为 null，如旧版服务器） */
   get serverInfo(): ServerInfo | null { return this._serverInfo; }
-  /** 服务器动态学习的公网隧道域名（隧道域名变化自动更新，用于邀请链接） */
+  /** 服务器可信来源确立的当前入口 host（IP 形态时就是 IP:端口） */
   get publicHost(): string | null { return this._publicHost; }
+  /** 服务器可信来源确立的当前入口完整 origin（带协议/端口；没有入口时为 null） */
+  get publicOrigin(): string | null { return this._publicOrigin; }
+  /** 服务器内部 id（8 位十六进制；同一进程内恒定，环境重建/重启后换新） */
+  get sid(): string | null { return this._sid; }
+  /** 服务器汇报的「当前实际入口」地址（稳定链接 302 的目标） */
+  get entryUrl(): string | null { return this._entryUrl; }
+  /**
+   * 设置「稳定链接」候选（形如 /<sid>/join/<room> 的站内路径，或完整 URL）。
+   * 每次连接/重连都实时求值 → 域名/IP 变了也不用改手；返回 null 则跳过该候选。
+   */
+  setEntryLink(fn: (() => string | null) | null): void { this.entryLink = fn; }
 
   /** 连接联机服务器：按候选顺序探测，直到某个地址返回 welcome 才算成功。 */
   connect(input: string | ServerCandidate[]): void {
     this.close();
-    this.candidates = (Array.isArray(input) ? input.slice() : [input]).filter(Boolean);
+    const base = (Array.isArray(input) ? input.slice() : [input]).filter(Boolean);
+    // 稳定链接优先：只要手里有「稳定入口」，就先由它寻址（服务器 302/后续跳转会把我们带到当前地址）；
+    // 失败再按常规候选（同源 → :3001）兜底，绝不因为匹配失败而连不上。
+    this.candidates = this.entryLink ? [this.entryLink, ...base] : base;
     this.candIdx = 0;
     this.tryNextCandidate();
   }
@@ -119,7 +150,7 @@ export class NetClient {
   private openWithProbe(url: string): void {
     let ws: WebSocket;
     try {
-      ws = new WebSocket(url);
+      ws = new WebSocket(normalizeWsUrl(url));
     } catch {
       this.tryNextCandidate();
       return;
@@ -179,10 +210,13 @@ export class NetClient {
           this._serverInfo = { lanIps: si.lanIps.map(String), port: Number(si.port) || 3001 };
         }
         if (typeof m.publicHost === "string" && m.publicHost) this._publicHost = m.publicHost;
+        if (typeof m.publicOrigin === "string" && m.publicOrigin) this._publicOrigin = m.publicOrigin.replace(/\/+$/, "");
+        this.applyEntry(m.sid, m.url);
         this.emit("welcome", this._myClientId); break;
       }
       case "tables":
         if (typeof m.publicHost === "string" && m.publicHost) this._publicHost = m.publicHost;
+        if (typeof m.publicOrigin === "string" && m.publicOrigin) this._publicOrigin = m.publicOrigin.replace(/\/+$/, "");
         this.emit("tables", m.tables); break;
       case "table": this.emit("table", m.table); break;
       case "start": {
@@ -196,7 +230,9 @@ export class NetClient {
       case "gameover": this.emit("gameover", m.info); break;
       case "peer_input": this.emit("peerInput", m as unknown as PeerInputMsg); break;
       case "peer_left": this.emit("peerLeft", Number(m.idx)); break;
-      case "pong": this.emit("pong", Number(m.ts)); break;
+      case "pong":
+        this.applyEntry(m.sid, m.url);
+        this.emit("pong", Number(m.ts)); break;
       case "levelup": this.emit("levelup", { playerIdx: Number(m.playerIdx), choices: (m.choices as NetLvlChoice[]) ?? [] }); break;
       case "pick_levelup": this.emit("pickLevelup", m as unknown as PickLevelUpMsg); break;
       case "shopstate": this.emit("shopstate", { stock: Array.isArray(m.stock) ? m.stock as ShopStockView[] : [] }); break;
@@ -212,6 +248,16 @@ export class NetClient {
       case "error": this.emit("error", String(m.msg)); break;
       case "left": this.emit("left"); break;
     }
+  }
+
+  /** 记录服务器汇报的内部 id / 当前入口；变化时通知上层（上层自动刷新稳定链接） */
+  private applyEntry(sid: unknown, url: unknown): void {
+    const s = typeof sid === "string" && /^[0-9a-f]{8}$/.test(sid) ? sid : null;
+    const u = typeof url === "string" && url ? url.replace(/\/+$/, "") : null;
+    const changed = (s && s !== this._sid) || (u && u !== this._entryUrl);
+    if (s) this._sid = s;
+    if (u) this._entryUrl = u;
+    if (changed) this.emit("entry", { sid: this._sid ?? "", url: this._entryUrl });
   }
 
   // ── 大厅操作 ──

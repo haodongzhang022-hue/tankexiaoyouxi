@@ -23,8 +23,10 @@ export interface ServerInfo {
   lanIps: string[];   // 本机局域网 IPv4（已按可分享概率排序）
   port: number;       // 联机端口
 }
-export interface WelcgMsg { t: "welcome"; clientId: number; serverInfo?: ServerInfo; }
-export interface TablesMsg { t: "tables"; tables: NetTable[]; }
+/** v3.0 服务器可信来源确立的当前入口：host 供展示，origin 供生成邀请链接（含协议/端口，IP 形态也能用） */
+export interface EntryOriginFields { publicHost?: string; publicOrigin?: string; }
+export interface WelcgMsg extends EntryOriginFields { t: "welcome"; clientId: number; serverInfo?: ServerInfo; }
+export interface TablesMsg extends EntryOriginFields { t: "tables"; tables: NetTable[]; }
 export interface TableMsg { t: "table"; table: NetTable; }
 export interface StartMsg {
   t: "start";

@@ -171,29 +171,37 @@ try {
     ok(`🔴3 [${label}] 标题带/URL 带与任何按钮矩形零相交`, hitT.length === 0 && hitU.length === 0,
       `标题带 y=${titleBand.y}..${titleBand.y + titleBand.h} 命中=${hitT.length}；URL 带 y=${urlBand.y}..${urlBand.y + urlBand.h} 命中=${hitU.length}`);
     const AMBER = [255, 170, 0];       // 局域网态标题色 #ffaa00
+    const GREEN = [143, 255, 143];     // 公网态标题色 #8fff8f（服务器已登记入口时 isPub=true）
     const BTNBG = [20, 28, 43];        // 新按钮底色 #141c2b（大色块 = 遮挡的直接证据）
     const CYAN = [102, 204, 255];      // URL 色 #66ccff
-    const tAmber = (await scan(page, titleBand.y, titleBand.y + titleBand.h - 1, AMBER, 45)).n;
+    // 🟡1 修复：main 的标题色是 isPub ? 绿 : 琥珀，而 isPub 取决于「服务器是否已登记入口」——
+    //   同机跑多次时入口登记状态会变（A 组琥珀计数在 0/16px 间漂移 → 旧断言 bT < aT*0.3 假失败）。
+    //   基线口径改为「琥珀或绿」的最大值（= 标题字形总量），不再依赖 isPub 落在哪一侧。
+    const titleInk = async (pg, y0, y1) => {
+      const amber = (await scan(pg, y0, y1, AMBER, 45)).n;
+      const green = (await scan(pg, y0, y1, GREEN, 45)).n;
+      return { amber, green, ink: Math.max(amber, green) };
+    };
+    const tInk = await titleInk(page, titleBand.y, titleBand.y + titleBand.h - 1);
     const tBtnRun = (await longestRun(page, titleBand.y, titleBand.y + titleBand.h - 1, BTNBG, 2)).len;
     const uCyan = (await scan(page, urlBand.y, urlBand.y + urlBand.h - 1, CYAN, 45)).n;
     const uBtnRun = (await longestRun(page, urlBand.y, urlBand.y + urlBand.h - 1, BTNBG, 2)).len;
     // A 组（main 对照）：main 标题基线 H-134 / URL H-118，新按钮不存在
     const a = await open(3002, vw, vh, "?room=1");
     await sleep(3000);
-    const aT = (await scan(a.page, H - 145, H - 130, AMBER, 45)).n;
-    const aRun = (await longestRun(a.page, H - 145, H - 130, BTNBG, 2)).len;
+    const aInk = await titleInk(a.page, H - 145, H - 130);
     await a.ctx.close();
     // B 组（返工前 PR）：新按钮压在标题行上（底色长条 = 遮挡）
     const b = await open(3003, vw, vh, "?room=1&debug=1");
     await sleep(3000);
-    const bT = (await scan(b.page, H - 145, H - 130, AMBER, 45)).n;
+    const bInk = await titleInk(b.page, H - 145, H - 130);
     const bRun = (await longestRun(b.page, H - 145, H - 130, BTNBG, 2)).len;
     await b.ctx.close();
     // 判据：C 组标题字形可见（≥ A 组 60%）+ 标题/URL 带内无按钮色块（最长连续段 < 8px，零散抗锯齿不算）
     //       + B 组确实被遮（底色长条 ≥ 100px 且标题字形塌陷）→ 证明确有回归且已修
     ok(`🔴3 [${label}] 像素自证：标题可见（≥A 的 60%）+ 标题/URL 带内无按钮色块`,
-      tAmber >= aT * 0.6 && tAmber > 0 && tBtnRun < 8 && uBtnRun < 8 && uCyan > 0 && bRun >= 100 && bT < aT * 0.3,
-      `标题琥珀像素：A(main)=${aT} ｜ B(返工前)=${bT} ｜ C(返工后)=${tAmber}；标题带内按钮色块最长=${tBtnRun}px（B 组同带=${bRun}px）；URL 字形=${uCyan}px URL 带内按钮色块最长=${uBtnRun}px`);
+      tInk.ink >= aInk.ink * 0.6 && tInk.ink > 0 && tBtnRun < 8 && uBtnRun < 8 && uCyan > 0 && bRun >= 100 && bInk.ink < aInk.ink * 0.3,
+      `标题字形像素(琥珀/绿取最大)：A(main)=${aInk.ink}(琥珀${aInk.amber}/绿${aInk.green}) ｜ B(返工前)=${bInk.ink}(琥珀${bInk.amber}/绿${bInk.green}) ｜ C(返工后)=${tInk.ink}(琥珀${tInk.amber}/绿${tInk.green})；标题带内按钮色块最长=${tBtnRun}px（B 组同带=${bRun}px）；URL 字形=${uCyan}px URL 带内按钮色块最长=${uBtnRun}px`);
     await ctx.close();
   }
 
