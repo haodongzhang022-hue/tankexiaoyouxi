@@ -9,9 +9,9 @@
 //           换新 sid 给可操作提示页、不误伤 / 与静态资源
 //   🔴 回归（PR #7 评审）：伪造 Host 的匿名 HTTP 请求**不得**改写「当前入口」，
 //           即分享出去的稳定链接不可能被一条 curl 指向攻击者域名
-//   🔴 回归（PR #8 评审 🔴2）：**IP / 局域网形态部署**（deploy/ 主推形态）带令牌登记后，
+//   🔴 回归（Issue #11 评审 🔴2）：**IP / 局域网形态部署**（deploy/ 主推形态）带令牌登记后，
 //           稳定链接必须 302 到**那个 IP**（不是访问者自己的 127.0.0.1）；没有入口时给提示页
-//   🔴 回归（PR #8 评审 🔴3）：模板里含**残留占位符**（{{port}} 大小写/拼写变化）时，
+//   🔴 回归（Issue #11 评审 🔴3）：模板里含**残留占位符**（{{port}} 大小写/拼写变化）时，
 //           绝不允许它成为「当前入口」（否则全量分享链接 302 到死链）
 //   🟡 回归：显式登记优先级最高（不被下一次平台模板刷新顶回）、响应返回真实落盘值；
 //           令牌文件 0600 + 不跟随符号链接（低权进程读不到）
@@ -233,7 +233,7 @@ test("🔴 回归：无客户端连接时，仅凭伪造 Host 的匿名请求不
   assert.equal(r3.location, "https://game.example.com/?room=7", "攻击者 Host 不得顶掉已确立的当前入口");
 });
 
-test("🔴 回归（PR #8 🔴2）：IP 形态部署登记后，稳定链接 302 到那个 IP（不是 127.0.0.1）", async (t) => {
+test("🔴 回归（Issue #11 🔴2）：IP 形态部署登记后，稳定链接 302 到那个 IP（不是 127.0.0.1）", async (t) => {
   const s = await startServer();
   t.after(() => s.stop());
 
@@ -261,7 +261,7 @@ test("🔴 回归（PR #8 🔴2）：IP 形态部署登记后，稳定链接 302
   assert.equal(r4.location, "http://192.168.1.50:3001/?room=3");
 });
 
-test("🔴 回归（PR #8 🔴2）：没有入口时给可操作提示页（含登记命令），绝不回退 127.0.0.1", async (t) => {
+test("🔴 回归（Issue #11 🔴2）：没有入口时给可操作提示页（含登记命令），绝不回退 127.0.0.1", async (t) => {
   const s = await startServer();
   t.after(() => s.stop());
 
@@ -273,7 +273,7 @@ test("🔴 回归（PR #8 🔴2）：没有入口时给可操作提示页（含�
   assert.ok(!/http:\/\/127\.0\.0\.1:\d+\/\?room=/.test(r.body), "不得把好友指向他自己的回环地址");
 });
 
-test("🔴 回归（PR #8 🔴3）：模板含残留占位符时不得成为「当前入口」", async (t) => {
+test("🔴 回归（Issue #11 🔴3）：模板含残留占位符时不得成为「当前入口」", async (t) => {
   // 平台变量拼写变化（大小写等）→ {{PORT}} 替不掉；旧实现把它原样当 current，全量链接 302 到死链
   const bad = await startServer({ env: { CNB_VSCODE_PROXY_URI: "https://env-{{PORT}}.cnb.run" } });
   t.after(() => bad.stop());
@@ -296,7 +296,7 @@ test("🔴 回归（PR #8 🔴3）：模板含残留占位符时不得成为「�
   assert.equal((await health(ok.base)).current, `https://env-5201-${ok.port}.cnb.run`);
 });
 
-test("🔴 回归（PR #8 🔴2）：未授权的私网/回环地址不能当入口", async (t) => {
+test("🔴 回归（Issue #11 🔴2）：未授权的私网/回环地址不能当入口", async (t) => {
   const s = await startServer();
   t.after(() => s.stop());
   for (const bad of ["http://127.0.0.1:3001", "http://localhost:3001", "http://0.0.0.0:3001", "not-a-url"]) {
@@ -308,7 +308,7 @@ test("🔴 回归（PR #8 🔴2）：未授权的私网/回环地址不能当入
   assert.equal((await health(s.base)).current, null, "被拒的地址不得生效");
 });
 
-test("🟡 回归（PR #8 🟡1）：显式登记优先级最高，不被平台模板刷新顶回；响应回真实落盘值", async (t) => {
+test("🟡 回归（Issue #11 🟡1）：显式登记优先级最高，不被平台模板刷新顶回；响应回真实落盘值", async (t) => {
   const s = await startServer({ env: { CNB_VSCODE_PROXY_URI: "https://env-5201-{{port}}.cnb.run" } });
   t.after(() => s.stop());
   assert.equal((await health(s.base)).current, `https://env-5201-${s.port}.cnb.run`, "初始按平台模板");
@@ -333,7 +333,7 @@ test("🟡 回归（PR #8 🟡1）：显式登记优先级最高，不被平台�
   assert.equal(fs.readFileSync(s.tokenFile + ".url", "utf8").trim(), "https://my.cpolar.cn");
 });
 
-test("🟡 回归（PR #8 🟡3）：令牌文件 0600，且不跟随符号链接", async (t) => {
+test("🟡 回归（Issue #11 🟡3）：令牌文件 0600，且不跟随符号链接", async (t) => {
   // ① 预置 0644 的令牌文件 → 启动后必须被收成 0600
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tank-token-"));
   const tf = path.join(dir, "token");

@@ -66,7 +66,7 @@ $:
         - name: build-dist
           script: npm run build
         - name: stable-entry-regression
-          # 稳定入口回归锁（PR #8 评审 🟡2：不进门禁的锁必腐）。
+          # 稳定入口回归锁（Issue #11 评审 🟡2：不进门禁的锁必腐）。
           # 真起服务器 + 真发 HTTP，覆盖：IP 形态登记 → 302 到该 IP、伪造 Host 不得改写入口、
           # 模板残留占位符不得成为入口、显式登记优先级、令牌 0600 + 不跟随符号链接。
           script: npm run net:entry-test

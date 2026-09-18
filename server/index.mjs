@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket } from "ws";
 // 预览地址变量表/落盘读写的「单一事实源」（与 scripts/net-tunnel.mjs 共用同一份，避免漂移）
 // ⚠ 只从单一事实源取「平台预览地址」与落盘读写；预览模板变量表（PREVIEW_TPL_KEYS）只被
-//   detectPreviewUrl 内部使用 —— 服务器不再自己拼模板域名（PR #8 评审 🔴3：自拼会产出未校验的垃圾域名）。
+//   detectPreviewUrl 内部使用 —— 服务器不再自己拼模板域名（Issue #11 评审 🔴3：自拼会产出未校验的垃圾域名）。
 import { detectPreviewUrl, writePublicUrl, PUBLIC_URL_FILE } from "../shared/preview-url.mjs";
 // 「稳定入口 ↔ 当前临时地址」自动匹配表（与共享层同一份实现，见 shared/entry-match.mjs）
 import { createEntryMatcher, entryPath, makeSid, SID_RE, ENTRY_TTL_MS, ENTRY_KEEPALIVE_MS, ENTRY_SWEEP_MS, normalizeOrigin, originScope, hasTemplatePlaceholder } from "../shared/entry-match.mjs";
@@ -60,7 +60,7 @@ const entries = createEntryMatcher(SID);
 // 请求 Host 只在**已经存在**「当前入口」时用来做同源跳转判断，永远不参与建立与迁移。
 const ENTRY_PROBE_TOKEN_FILE = process.env.TANK_ENTRY_TOKEN_FILE || `/tmp/tank-entry-${PORT}.token`;
 const ENTRY_PROBE_TOKEN = crypto.randomBytes(16).toString("hex");
-/** 令牌落盘：0600 + 不跟随符号链接（预置 0644 / 指向别处的符号链接都要挡住，见 PR #8 评审 🟡3） */
+/** 令牌落盘：0600 + 不跟随符号链接（预置 0644 / 指向别处的符号链接都要挡住，见 Issue #11 评审 🟡3） */
 function writeEntryTokenFile(file) {
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -298,7 +298,7 @@ function publicHostOfCurrent() {
 function currentPublicHost() { return publicHostOfCurrent(); }
 // v3.0.2 说明：原本还有一个 originOfRequest(req)（用请求 Host + x-forwarded-proto 拼 origin）供
 // trustedTarget 做"同源省一跳"判断 —— x-forwarded-proto 由调用方控制，能伪造出 http:// 降级跳转
-// （PR #8 评审 🟢）。现在 302 目标一律是「已确立的可信入口」原文，不再需要它，故删除（死代码清零）。
+// （Issue #11 评审 🟢）。现在 302 目标一律是「已确立的可信入口」原文，不再需要它，故删除（死代码清零）。
 /**
  * 刷新「当前入口」并自动登记到匹配表（稳定入口 → 当前地址）。
  * ⚠ 只允许**可信来源**调用（见 recalcTrustedEntryOrigin）：入口地址决定了稳定链接的 302 目标，
@@ -324,7 +324,7 @@ function entryRejectReason(origin) {
 /**
  * 重新计算「当前入口」——**只看可信来源**，不看请求 Host（优先级由高到低）：
  *   ① 显式登记（部署脚本 / net:tunnel 写入 `<token>.url`，需令牌或容器内写权限）——
- *      部署者说了算：不会被平台模板的下一轮刷新顶回（PR #8 评审 🟡1）；
+ *      部署者说了算：不会被平台模板的下一轮刷新顶回（Issue #11 评审 🟡1）；
  *   ② 平台注入的端口预览地址（经 detectPreviewUrl → buildPreviewUrl 同口径校验，残留占位符作废）；
  *   ③ 上一次已被可信来源确立的当前入口（保持在服务的那个地址，不被匿名请求改写）。
  * /healthz 这类只读探针也走这里：没有可信来源时，current 保持为空 —— 宁可暂时没有入口，也不给坏地址
@@ -341,7 +341,7 @@ function refreshCurrentOriginFromTrusted(why) {
 
 /**
  * 落盘登记的对外入口（部署脚本 / net:tunnel 写 `<token file>.url`，服务器读）。
- * 存在 = 部署者**显式指定**了入口 → 优先级最高（不会被平台模板的下一轮刷新顶回，见 PR #8 评审 🟡1）。
+ * 存在 = 部署者**显式指定**了入口 → 优先级最高（不会被平台模板的下一轮刷新顶回，见 Issue #11 评审 🟡1）。
  */
 function readRegisteredEntryOrigin() {
   try {
@@ -419,7 +419,7 @@ function confirmOriginFromClient() {
 }
 /**
  * 是否为「可分享的对外入口」。
- * v3.0.2（PR #8 评审 🔴2）：**公网 IP 与（可信来源显式登记的）局域网 IP 都算数** ——
+ * v3.0.2（Issue #11 评审 🔴2）：**公网 IP 与（可信来源显式登记的）局域网 IP 都算数** ——
  * 「没有域名」的部署形态（deploy/Dockerfile + start-server.sh 主推形态）必须能拿到入口，
  * 否则稳定链接只能落到 127.0.0.1 兜底，等于把好友送到他自己的机器上。
  * 回环（127./::1/localhost）与未授权私网地址仍然拒收。
@@ -444,12 +444,12 @@ function fallbackEntryOrigin() {
  *   ② 否则退回登记表/已确立入口（同样来自可信来源）；
  *   ③ 实在没有 → 返回 ""（调用方给 sendEntryGone 提示页）。
  *      ⚠ v3.0.2：不再回退 `http://127.0.0.1:PORT` —— 那会把好友 302 到**他自己**机器的回环地址
- *        （甚至可能是他自己跑的服务），比"暂时没有入口"更糟（PR #8 评审 🔴2）。
+ *        （甚至可能是他自己跑的服务），比"暂时没有入口"更糟（Issue #11 评审 🔴2）。
  */
 function trustedTarget() {
   // 目标 = 「已确立的可信入口」原文（不掺入访问者的任何自报信息）。
   // 同源访问时访问者用的就是这条地址本身，302 回它等价于"原地不动"，因此不需要另算"省一跳"的地址 ——
-  // 旧写法用请求 Host + x-forwarded-proto 拼同源地址，可被伪造出 http:// 降级跳转（PR #8 评审 🟢）。
+  // 旧写法用请求 Host + x-forwarded-proto 拼同源地址，可被伪造出 http:// 降级跳转（Issue #11 评审 🟢）。
   const cur = normalizeOrigin(CURRENT_ORIGIN);
   if (cur && isShareableOrigin(cur, { allowPrivateIp: true })) return cur;
   return fallbackEntryOrigin();

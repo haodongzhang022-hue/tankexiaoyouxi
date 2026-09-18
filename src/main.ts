@@ -200,7 +200,7 @@ function onEntryReport(sid: string, url: string | null): void {
 /**
  * 服务器入口变化 → 稳定链接自动挂到新入口上。
  * v3.0.2：接受**完整 origin**（http://203.0.113.9:3001 / https://game.example.com），
- * 不再硬拼 `https://` —— IP 形态部署（无域名）也要能分享出可用链接（PR #8 评审 🔴2）。
+ * 不再硬拼 `https://` —— IP 形态部署（无域名）也要能分享出可用链接（Issue #11 评审 🔴2）。
  */
 function keepStableEntryForOrigin(origin: string | null): void {
   const card = entryMgr.peek();
