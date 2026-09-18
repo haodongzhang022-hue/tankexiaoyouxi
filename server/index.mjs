@@ -25,7 +25,7 @@ import { WebSocketServer, WebSocket } from "ws";
 //   detectPreviewUrl 内部使用 —— 服务器不再自己拼模板域名（Issue #11 评审 🔴3：自拼会产出未校验的垃圾域名）。
 import { detectPreviewUrl, writePublicUrl, PUBLIC_URL_FILE } from "../shared/preview-url.mjs";
 // 「稳定入口 ↔ 当前临时地址」自动匹配表（与共享层同一份实现，见 shared/entry-match.mjs）
-import { createEntryMatcher, entryPath, makeSid, SID_RE, ENTRY_TTL_MS, ENTRY_KEEPALIVE_MS, ENTRY_SWEEP_MS, normalizeOrigin, originScope, ipScope, hasTemplatePlaceholder } from "../shared/entry-match.mjs";
+import { createEntryMatcher, entryPath, makeSid, SID_RE, ENTRY_TTL_MS, ENTRY_KEEPALIVE_MS, ENTRY_SWEEP_MS, normalizeOrigin, originScope, ipScope, hasTemplatePlaceholder, localTipAllowedFor } from "../shared/entry-match.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DIST_DIR = path.resolve(__dirname, "..", "dist");
@@ -196,6 +196,9 @@ npm run build</pre>
 const httpServer = http.createServer((req, res) => {
   // ⚠ 不再从进站请求的 Host 学习公网域名：Host 可伪造，会把「当前入口」与邀请链接域名
   //   指向攻击者（PR #7 评审 🔴1）。公网入口只由可信来源确立（模板 / 落盘登记 / 带令牌探针）。
+  // 先留一份「本请求到达前」的入口快照：带令牌的请求会在下面 takeEntryTrustSignal 里**立即**应用
+  // 新入口，若各处都读 CURRENT_ORIGIN 就会把「已被本请求改过的值」当成 previous 回给调用方（误导）。
+  req.entryBeforeRequest = normalizeOrigin(CURRENT_ORIGIN);
   takeEntryTrustSignal(req, "http");
   if (!req.url || req.method !== "GET") { res.writeHead(405); res.end(); return; }
   // 解析路径并防目录穿越
@@ -236,34 +239,55 @@ const httpServer = http.createServer((req, res) => {
       note: persisted ? "已落盘，服务器重启后仍生效" : "仅进程内生效：落盘失败（检查 " + ENTRY_PROBE_TOKEN_FILE + ".url 的写权限）",
     });
   }
-  // ── 入口可达性上报（玩家自救，Issue #11）────────────────────────
+  // ── 入口可达性上报（玩家自救，Issue #11；🔴 准入加固见 Issue #15）──────
   // 场景：服务器登记的入口（公网 IP / 域名）在后端网络里连不上 —— 玩家打开的这个地址却是通的。
   // 这时「登记的入口」对这名玩家等于死路，得让它就地用当前地址开玩。
-  // ⚠ 只在「已有可信来源登记的入口」时接受修正（不能从无到有地建立入口）：
-  //    否则「请求方自报的地址」又变成入口，就是之前被修掉的钓鱼漏洞（PR #7 评审 🔴1）。
-  //    另外这条上报只影响**入口**，不改变任何鉴权/权限。
+  //
+  // ⚠⚠ Issue #15（🔴 钓鱼面）：本路由此前**不需要任何令牌**就能改写全局入口并落盘 ——
+  //    一条 `curl '/entry/localtip?origin=http://phish.example.net'` 就把房主分享出去的稳定链接
+  //    302 到攻击者域名，且重启仍生效。旧注释声称的前置条件「只在已有登记入口时才接受修正」
+  //    挡不住：服务器启动即自动登记本机 LAN IP（autoRegisterLocalEntry，currentSource=register），
+  //    该条件**默认恒为真**。与 PR #7 评审 🔴1（Host 伪造劫持）同源 —— 入口地址决定 302 目标，
+  //    **绝不能被请求方自报的值改写**（`?origin=` 只是 Host 的另一个马甲）。
+  //
+  // 现在的准入（满足其一才接受修正，见 localTipAllowed）：
+  //   ① 携带一次性部署令牌（与 /entry/register 同等口径）—— 部署者/探针显式自救；
+  //   ② **本机/同内网**自救：上报地址必须是**本机网卡自己的 IP**（LAN_IPS），且 TCP 对端来自
+  //      私网/回环 —— 即「你报的这个地址就是我，而且你就跟我同一内网」。
+  //    → 「任意公网域名 / 任意公网 IP」一律 403（那正是钓鱼入口的写法）；
+  //      Issue #11 的「房主同 WiFi 打开、登记的入口在他那侧不通」照旧可用。
+  //    → 公网侧的自救被拒后玩家**照旧能就地开玩**（前端已把当前地址落成本地稳定入口），
+  //      只是不再让「某一个玩家的网络状况」改写所有人的全局入口（刻意的可用性取舍）。
+  //    这条上报只影响**入口**，不改变任何鉴权/权限。
   if (urlPath === "/entry/localtip") {
     const json = (code, obj) => {
       res.writeHead(code, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
       res.end(JSON.stringify(obj));
     };
-    const existing = normalizeOrigin(CURRENT_ORIGIN);
+    let rawTip = "";
+    try { rawTip = (new URL(req.url || "/", "http://x").searchParams.get("origin") || "").trim(); } catch { rawTip = ""; }
+    const info = originScope(rawTip, { allowPrivateIp: true });
+    if (!info.ok) return json(400, { ok: false, applied: false, reason: info.reason || "origin 不是可用的 http(s) 地址" });
+    const gate = localTipAllowed(req, rawTip);
+    if (!gate.ok) {
+      // ⚠ 日志里**不回显被拒的地址原文**（那是攻击者可控的字符串，回显等于给它一个写入日志的通道）；
+      //   只记「谁在试 + 为什么拒」，足够审计与定位。
+      console.warn(`[入口] 拒绝可达性上报（Issue #15）: 对端=${peerIpOf(req) || "?"} ← ${gate.reason}`);
+      return json(403, { ok: false, applied: false, current: normalizeOrigin(CURRENT_ORIGIN) || null, reason: gate.reason });
+    }
+    const tip = info.origin;
+    const existing = req.entryBeforeRequest || normalizeOrigin(CURRENT_ORIGIN);
     if (!existing) return json(409, { ok: false, applied: false, reason: "尚无登记入口，不接受可达性上报（避免把请求方自报的地址当入口）" });
-    let tip = "";
-    try {
-      const q = new URL(req.url || "/", "http://x").searchParams;
-      tip = originScope((q.get("origin") || "").trim(), { allowPrivateIp: true }).ok
-        ? originScope((q.get("origin") || "").trim(), { allowPrivateIp: true }).origin
-        : "";
-    } catch { tip = ""; }
-    if (!tip) return json(400, { ok: false, applied: false, reason: "origin 不是可用的 http(s) 地址" });
-    if (tip === existing) return json(200, { ok: true, applied: false, current: existing, reason: "与当前入口一致" });
+    // 已经是这个入口：带令牌的调用仍要**补一次落盘**（否则本请求里 takeEntryTrustSignal 已应用的值
+    // 重启后就丢了）；匿名/本机自救则直接回「一致」，绝不在无变化时落盘 —— 免得把平台预览这种
+    // 临时入口写死成「显式登记」（那会在环境重建后被 readRegisteredEntryOrigin 优先读回旧域名）。
+    if (tip === existing && !gate.token) return json(200, { ok: true, applied: false, current: existing, reason: "与当前入口一致" });
     const applied = recordEntry(tip, "localtip", { allowPrivateIp: true });
     if (!applied) return json(400, { ok: false, applied: false, current: existing, reason: entryRejectReason(tip) });
     // 修正也要落盘，否则下一次刷新会被旧的落盘值顶回去（玩家会看到"修了又变回来"）
     const persisted = writeRegisteredEntryOrigin(applied);
-    console.log(`[入口] 按客户端可达性修正: ${existing} → ${applied}（登记入口在该玩家网络里连不上；persisted=${persisted}）`);
-    return json(200, { ok: true, applied: true, persisted, previous: existing, current: applied, source: "localtip（客户端可达性修正）" });
+    console.log(`[入口] 按可达性上报修正: ${existing} → ${applied}（准入：${gate.via}；persisted=${persisted}）`);
+    return json(200, { ok: true, applied: true, persisted, previous: existing, current: applied, source: `localtip（客户端可达性修正；${gate.via}）` });
   }
 
   // 健康检查（供 Docker HEALTHCHECK / 云负载均衡 / 你自己 curl 用）
@@ -447,6 +471,28 @@ function recordEntry(origin, why, opts = {}) {
 /** 登记被拒的原因（回给部署脚本，避免"静默无效"） */
 function entryRejectReason(origin) {
   return originScope(origin, { allowPrivateIp: true }).reason || "地址不可用作对外入口";
+}
+
+/**
+ * 请求的 TCP 对端 IP（去掉 IPv4-mapped IPv6 前缀 `::ffff:` —— Node 双栈监听下 IPv4 连接会带它，
+ * 不剥掉的话 ipScope 会把私网对端误判成 public）。用于 Issue #15 的「同内网自救」准入判定。
+ */
+function peerIpOf(req) {
+  const raw = String((req && req.socket && req.socket.remoteAddress) || "").trim().toLowerCase();
+  const m = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(raw);
+  return (m ? m[1] : raw).replace(/^\[|\]$/g, "");
+}
+
+/**
+ * `/entry/localtip` 的准入判定（Issue #15 🔴：匿名请求绝不能改写全局入口）。
+ * 判定逻辑放在 shared/entry-match.mjs（`localTipAllowedFor`）—— 与自测同一份实现，避免两处漂移。
+ * 这里只补上服务器侧才有的信息：本机网卡 IP 列表（LAN_IPS）与请求 TCP 对端 IP。
+ * @returns {{ok:true, via:string, token:boolean} | {ok:false, reason:string}} token=true 表示走的是部署令牌
+ */
+function localTipAllowed(req, tip) {
+  if (hasValidEntryToken(req)) return { ok: true, via: "probe_token（部署者显式自救）", token: true };
+  const r = localTipAllowedFor({ tip, peerIp: peerIpOf(req), ownIps: LAN_IPS });
+  return r.ok ? { ...r, token: false } : r;
 }
 
 /**
