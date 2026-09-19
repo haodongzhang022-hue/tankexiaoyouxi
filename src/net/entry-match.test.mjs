@@ -7,6 +7,8 @@
 //   origin 判定：回环 / 私网 / 公网 IP / 域名 / 残留占位符（纯逻辑）
 //   服务器：/<sid>/join/<room> 302（带 ?room）、老域名自动跟到当前地址、
 //           换新 sid 给可操作提示页、不误伤 / 与静态资源
+//   🔴 回归（Issue #15）：匿名 /entry/localtip（?origin= 攻击者域名/公网 IP，含伪造 x-forwarded-*）
+//           一律 403、不得改写入口、不得落盘；带部署令牌的合法自救仍可用（公网 IP / 域名）
 //   🔴 回归（PR #7 评审）：伪造 Host 的匿名 HTTP 请求**不得**改写「当前入口」，
 //           即分享出去的稳定链接不可能被一条 curl 指向攻击者域名
 //   🔴 回归（Issue #15）：**匿名请求不得改写「当前入口」** —— `/entry/localtip` 曾经无令牌即可
@@ -432,7 +434,9 @@ test("不误伤：/、静态资源、healthz、__whoami 都不受影响", async 
   const s = await startServer();
   t.after(() => s.stop());
 
-  const hasDist = fs.existsSync(path.resolve(__dirname, "..", "..", "dist", "index.html"));
+  // ⚠ dist 是否已构建：按**被测服务器所在目录**解析（与 __dirname 硬编码相对路径会让
+  //    "拿旧版 server 跑新测试"这类对照场景假失败）
+  const hasDist = fs.existsSync(path.join(path.dirname(SERVER), "..", "dist", "index.html"));
   const root = await redirectOf(s.base + "/");
   if (hasDist) assert.equal(root.status, 200, "/ 应返回 index.html");
   else assert.ok(root.status === 200 || root.status === 404, "/ 不应被入口路由吞掉（200 引导页 / 404 均可）");
@@ -545,27 +549,28 @@ test("🔴 回归（Issue #11）：入口从玩家那侧连不上时，允许按
   t.after(() => s.stop());
   assert.equal((await health(s.base)).current, "http://203.0.113.9:3001");
 
-  // 房主就在本机（127.0.0.1）打开：上报「我这台机器能连到的地址」= 本机网卡 IP → 允许修正
+  // main 的加固口径（Issue #15）：该路由要求一次性部署令牌 —— 部署者（后端网络到不了登记的入口）
+  // 持令牌上报「我这里实际能连到 198.51.100.20:3001」；本 PR 的准入（令牌 或 本机/同内网自救）
+  // 与之一致，此路径照旧 200；匿名版本已按漏洞修掉（见下方 🔴 回归）。
+  const r = await fetch(`${s.base}/entry/localtip?origin=${encodeURIComponent("http://198.51.100.20:3001")}`, {
+    headers: { "X-Tank-Entry-Token": s.token },
+  });
+  const j = await r.json();
+  assert.equal(r.status, 200, `带令牌的自救应被接受（实际 ${r.status}）`);
+  assert.equal(j.applied, true);
+  assert.equal(j.previous, "http://203.0.113.9:3001");
+  assert.equal(j.current, "http://198.51.100.20:3001");
+  assert.equal((await health(s.base)).current, "http://198.51.100.20:3001", "入口应被修正为玩家真的连得上的地址");
+  const red = await redirectOf(`${s.base}/${SID}/join/4`);
+  assert.equal(red.location, "http://198.51.100.20:3001/?room=4");
+
+  // 本机/同内网自救（本 PR 的准入②）：房主就在本机打开、上报本机网卡 IP → 同样放行
   const lanIp = Object.values(os.networkInterfaces()).flat().filter(Boolean)
     .find((ni) => ni.family === "IPv4" && !ni.internal)?.address;
   assert.ok(lanIp, "本机应有至少一个非回环 IPv4（用于本用例）");
-  const r = await fetch(`${s.base}/entry/localtip?origin=${encodeURIComponent(`http://${lanIp}:${s.port}`)}`);
-  const j = await r.json();
-  assert.equal(r.status, 200, `本机自救应被接受（实际 ${r.status}）`);
-  assert.equal(j.applied, true);
-  assert.equal(j.previous, "http://203.0.113.9:3001");
-  assert.equal(j.current, `http://${lanIp}:${s.port}`);
-  assert.equal((await health(s.base)).current, `http://${lanIp}:${s.port}`, "入口应被修正为玩家真的连得上的地址");
-  const red = await redirectOf(`${s.base}/${SID}/join/4`);
-  assert.equal(red.location, `http://${lanIp}:${s.port}/?room=4`);
-
-  // 带部署令牌的显式自救（部署者/探针）→ 任意公网地址也允许
-  const tok = await fetch(`${s.base}/entry/localtip?origin=${encodeURIComponent("http://198.51.100.20:3001")}`, {
-    headers: { "X-Tank-Entry-Token": s.token },
-  });
-  const tj = await tok.json();
-  assert.equal(tok.status, 200, "带令牌的显式自救应被接受");
-  assert.equal(tj.current, "http://198.51.100.20:3001");
+  const local = await fetch(`${s.base}/entry/localtip?origin=${encodeURIComponent(`http://${lanIp}:${s.port}`)}`);
+  assert.equal(local.status, 200, "本机/同内网自救应被接受");
+  assert.equal((await local.json()).current, `http://${lanIp}:${s.port}`);
 });
 
 test("🔴 回归（Issue #15）：匿名 /entry/localtip 不得改写全局入口（复现姿势：?origin=攻击者域名）", async (t) => {
@@ -616,6 +621,59 @@ test("🔴 回归（Issue #15）：匿名 /entry/localtip 不得改写全局入�
   assert.notEqual(j4.previous, j4.current);
   const red4 = await redirectOf(`${s.base}/${SID}/join/7`);
   assert.equal(red4.location, "http://203.0.113.9:3001/?room=7");
+});
+
+// ── 🔴 回归（Issue #15 验收）────────────────────────────────────────
+//   匿名（无部署令牌 / 无任何伪造头）的 /entry/localtip 一律不得改写全局入口；
+//   合法自救必须携带一次性部署令牌。
+test("🔴 回归（Issue #15）：匿名 /entry/localtip 不得改写全局入口（?origin= 攻击者域名/公网 IP）", async (t) => {
+  const s = await startServer({ env: { TANK_AUTO_ENTRY: "0" } });
+  t.after(() => s.stop());
+  await register(s.base, "http://203.0.113.9:3001", s.token);   // 部署者显式登记
+  const before = (await health(s.base)).current;
+  assert.equal(before, "http://203.0.113.9:3001");
+
+  // 1) 攻击者用域名劫持（原 Issue #15 复现姿势）
+  for (const evil of ["https://phish.example.com", "http://198.51.100.7:3001"]) {
+    const r = await fetch(`${s.base}/entry/localtip?origin=${encodeURIComponent(evil)}`);
+    assert.equal(r.status, 403, `匿名上报 ${evil} 必须 403`);
+    assert.equal((await r.json()).applied, false);
+    assert.equal((await health(s.base)).current, before, "匿名上报不得改写当前入口");
+  }
+  // 2) 伪造 x-forwarded-* 头也不能放行（对端身份只能看 TCP 对端）
+  const fwd = await fetch(`${s.base}/entry/localtip?origin=${encodeURIComponent("http://198.51.100.7:3001")}`, {
+    headers: { "x-forwarded-for": "127.0.0.1", "x-real-ip": "10.0.0.1" },
+  });
+  assert.equal(fwd.status, 403, "伪造 x-forwarded-for/x-real-ip 不得放行");
+  // 3) 落盘未被污染：重启后入口仍是部署者登记的那个
+  assert.notEqual((await health(s.base)).current, "http://198.51.100.7:3001");
+  const red = await redirectOf(`${s.base}/${SID}/join/7`);
+  assert.equal(red.location, "http://203.0.113.9:3001/?room=7", "稳定链接不得 302 到攻击者地址");
+});
+
+test("🔴 回归（Issue #15）：带部署令牌的合法自救仍可用（?origin= 公网 IP / 域名）", async (t) => {
+  const s = await startServer({ env: { TANK_AUTO_ENTRY: "0" } });
+  t.after(() => s.stop());
+  await register(s.base, "http://203.0.113.9:3001", s.token);
+  const move = async (origin) => {
+    const res = await fetch(`${s.base}/entry/localtip?origin=${encodeURIComponent(origin)}`, { headers: { "X-Tank-Entry-Token": s.token } });
+    return { status: res.status, json: await res.json().catch(() => null) };
+  };
+  const a = await move("http://198.51.100.20:3001");
+  assert.equal(a.status, 200);
+  assert.equal(a.json.applied, true);
+  assert.equal((await health(s.base)).current, "http://198.51.100.20:3001");
+
+  // 公网域名形态同样允许（部署者换域名场景）——唯一不可信的是请求方，不是地址形态
+  const b = await move("https://new.example.com");
+  assert.equal(b.status, 200);
+  assert.equal((await health(s.base)).current, "https://new.example.com");
+  const red = await redirectOf(`${s.base}/${SID}/join/9`);
+  assert.equal(red.location, "https://new.example.com/?room=9", "稳定链接应跟到新域名");
+
+  // 未带令牌/错令牌仍然 403
+  const c = await fetch(`${s.base}/entry/localtip?origin=${encodeURIComponent("http://198.51.100.21:3001")}`);
+  assert.equal(c.status, 403);
 });
 
 test("🔴 回归（Issue #11）：没有任何登记入口时，可达性上报不得凭请求方地址建立入口（钓鱼防线不退化）", async (t) => {

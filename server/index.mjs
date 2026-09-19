@@ -199,7 +199,10 @@ const httpServer = http.createServer((req, res) => {
   // 先留一份「本请求到达前」的入口快照：带令牌的请求会在下面 takeEntryTrustSignal 里**立即**应用
   // 新入口，若各处都读 CURRENT_ORIGIN 就会把「已被本请求改过的值」当成 previous 回给调用方（误导）。
   req.entryBeforeRequest = normalizeOrigin(CURRENT_ORIGIN);
-  takeEntryTrustSignal(req, "http");
+  // ⚠ 这里**只刷新入口**（`refreshOnly`），不做显式登记：路由自己还要解析 query（如 /entry/localtip 的
+  //    `origin=`），若在此按登记处理就会先把参数吃走（Issue #15 根因）。显式登记只在下面的
+  //    `/entry/register` 专用路由里处理（令牌 + `url=` 参数，语义唯一）。
+  takeEntryTrustSignal(req, "http", { refreshOnly: true });
   if (!req.url || req.method !== "GET") { res.writeHead(405); res.end(); return; }
   // 解析路径并防目录穿越
   let urlPath;
@@ -259,6 +262,19 @@ const httpServer = http.createServer((req, res) => {
   //    → 公网侧的自救被拒后玩家**照旧能就地开玩**（前端已把当前地址落成本地稳定入口），
   //      只是不再让「某一个玩家的网络状况」改写所有人的全局入口（刻意的可用性取舍）。
   //    这条上报只影响**入口**，不改变任何鉴权/权限。
+  // 与 main（v3.0.4）的口径合并：准入 = ① 一次性部署令牌（与 /entry/register 同等口径）**或**
+  // ② 本机/同内网自救（本 PR 新增，见 shared/entry-match.mjs 的 localTipAllowedFor）。
+  // Issue #15 起两条都是**必要条件**；任一条不满足 → 403 + 入口不变 + 不落盘。
+  // main 旧注释里的「匿名放行两版判定都被证伪」留痕（下方 ②③ 即那两版）：本 PR 的 ② 之所以不同于
+  // 被证伪的版本，是它**同时**要求「上报地址 = 本机网卡 IP」+「对端来自私网/回环」，
+  // 且 main 的 refreshOnly 修掉了 `?origin=` 被当登记参数吃走的问题。
+  // ── 入口可达性上报（玩家自救，Issue #11）────────────────────────
+  // 场景：服务器登记的入口（公网 IP / 域名）连不上，页面实际是通过另一个地址打开的。
+  // ⚠ 该路由会**落盘改写全局入口**（影响所有人的分享链接），因此**必须带一次性部署令牌**：
+  //    「已有登记入口」在这套实现里恒为真（服务器启动即自动登记），不构成任何保护 —— 见 Issue #15。
+  //    普通玩家的自救不依赖这条路由：前端探到登记入口不可达就地开玩，不改写全局入口。
+  //    另外这条上报只影响**入口**，不改变任何鉴权/权限。
+
   if (urlPath === "/entry/localtip") {
     const json = (code, obj) => {
       res.writeHead(code, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
@@ -278,9 +294,14 @@ const httpServer = http.createServer((req, res) => {
     const tip = info.origin;
     const existing = req.entryBeforeRequest || normalizeOrigin(CURRENT_ORIGIN);
     if (!existing) return json(409, { ok: false, applied: false, reason: "尚无登记入口，不接受可达性上报（避免把请求方自报的地址当入口）" });
-    // 已经是这个入口：带令牌的调用仍要**补一次落盘**（否则本请求里 takeEntryTrustSignal 已应用的值
-    // 重启后就丢了）；匿名/本机自救则直接回「一致」，绝不在无变化时落盘 —— 免得把平台预览这种
-    // 临时入口写死成「显式登记」（那会在环境重建后被 readRegisteredEntryOrigin 优先读回旧域名）。
+    // ⚠ 鉴权（Issue #15）：这条路由会**落盘改写全局入口**，因此必须过准入（见上方 localTipAllowed）：
+    //    ① 一次性部署令牌（`?probe_token=` / `X-Tank-Entry-Token`，与 /entry/register 同等口径）；
+    //    ② 本机/同内网自救（上报地址 = 本机网卡 IP 且对端来自私网/回环）。
+    //    详见 shared/entry-match.mjs 的 localTipAllowedFor（准入单一事实源），判定在路由入口处已完成。
+    //
+    //    已经是这个入口：带令牌的调用仍要**补一次落盘**（否则本请求里 takeEntryTrustSignal 已应用的值
+    //    重启后就丢了）；匿名/本机自救则直接回「一致」，绝不在无变化时落盘 —— 免得把平台预览这种
+    //    临时入口写死成「显式登记」（那会在环境重建后被 readRegisteredEntryOrigin 优先读回旧域名）。
     if (tip === existing && !gate.token) return json(200, { ok: true, applied: false, current: existing, reason: "与当前入口一致" });
     const applied = recordEntry(tip, "localtip", { allowPrivateIp: true });
     if (!applied) return json(400, { ok: false, applied: false, current: existing, reason: entryRejectReason(tip) });
@@ -565,8 +586,13 @@ function writeRegisteredEntryOrigin(origin) {
  * 普通玩家或外部攻击者拿不到（Host 头伪造因此彻底失效）。
  * @returns {boolean} 是否携带了有效令牌
  */
-function takeEntryTrustSignal(req, why) {
+function takeEntryTrustSignal(req, why, opts = {}) {
   if (!hasValidEntryToken(req)) return false;
+  // refreshOnly：只按可信来源刷新「当前入口」，**不把请求参数当登记地址**。
+  // 为什么需要这个开关：`?origin=` 既是历史登记别名，又是可达性上报（/entry/localtip）的入参名 ——
+  // 带令牌的 /entry/localtip?origin=X 会先在这里被当成「显式登记」，于是该请求在自己那条路由里
+  // 被静默改道（响应说"已修正"，其实 current 已被这次调用改成了别的值）。见 Issue #15 根因。
+  if (opts.refreshOnly) { refreshCurrentOriginFromTrusted(`${why}:probe`); return true; }
   const registered = registeredUrlOf(req);            // 部署探针可显式登记「本环境对外的公网入口」
   if (registered) recordEntry(registered, `${why}:register`, { allowPrivateIp: true });
   else refreshCurrentOriginFromTrusted(`${why}:probe`);
@@ -593,7 +619,11 @@ function probeTokenOf(req) {
 function registeredUrlRaw(req) {
   try {
     const q = new URL(req.url || "/", "http://x").searchParams;
-    return (q.get("url") || q.get("origin") || "").trim();
+    // ⚠ 只认 `url` 参数：曾经同时认 `origin`，而 `origin` 正是可达性上报（/entry/localtip）的入参名 ——
+    //    带令牌的 /entry/localtip?origin=X 会先被 takeEntryTrustSignal 当作「显式登记」处理，
+    //    于是令牌请求在**它自己那条路由**里被静默改道（响应说"与当前入口一致/已修正"，实际 current 是原值）。
+    //    Issue #15 顺手修掉这条参数别名（并删掉随之失效的 `?origin=` 登记姿势）。
+    return (q.get("url") || "").trim();
   } catch { return ""; }
 }
 function registeredUrlOf(req) {
