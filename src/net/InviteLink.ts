@@ -65,6 +65,30 @@ export function buildLobbyUrl(base: string, extraQuery = ""): string {
   return `${base}${base.includes("?") ? "&" : "?"}${q}`;
 }
 
+/** 邀请链接形态：`stable-entry` = 房号在路径 `/<sid>/join/<roomId>`；`plain` = 房号走 query `?room=`。 */
+export type InviteUrlMode = "stable-entry" | "plain";
+
+/** 稳定入口形态的路径：`/<sid>/join/<roomId>`（sid 为 8 位小写 hex，房号可选）。 */
+const STABLE_ENTRY_PATH_RE = /\/[0-9a-f]{8}\/join\/(\d*)(?:[?#]|$)/;
+
+/**
+ * base 路径里是否**已显式带房号**（`/<sid>/join/<roomId>`）。
+ * 用于 composeInviteUrl 的形态校验：带房号 → 必须用稳定入口形态，否则会拼出双房号畸形链接。
+ * 注意 `/<sid>/join/`（尾房号为空）不算「已带房号」，那种 base 仍需拼 `?room=`。
+ */
+export function hasExplicitRoomInPath(base: string): boolean {
+  const m = STABLE_ENTRY_PATH_RE.exec(base);
+  return !!m && m[1] !== "";
+}
+
+/**
+ * 由 base **推断**链接形态 —— 传给 composeInviteUrl 的第 4 参请用它，别手写布尔。
+ * 路径里已带房号 → `stable-entry`；否则 → `plain`。
+ */
+export function inviteUrlMode(base: string): InviteUrlMode {
+  return hasExplicitRoomInPath(base) ? "stable-entry" : "plain";
+}
+
 /**
  * 邀请链接的**最终成形**（稳定入口形态 vs 普通形态）—— 纯逻辑，可单测。
  *
@@ -75,12 +99,22 @@ export function buildLobbyUrl(base: string, extraQuery = ""): string {
  * @param base       入口基址（协议+主机+路径；稳定入口形态下形如 `https://h/<sid>/join/7`）
  * @param roomId     目标桌号（正整数）
  * @param extraQuery 额外入口参数（如 `server=ws://...`），稳定入口形态下会被忽略
- * @param roomInPath 房号是否**已在 base 路径里**（即稳定入口形态 `/<sid>/join/<roomId>`）
+ * @param mode       链接**形态**，必须显式传入（评审打回：默认值 `roomInPath=false` 是脚枪 ——
+ *                   稳定 base 漏传第 4 参会静默产出 `/<sid>/join/7?room=7` 这种双房号畸形链接）。
+ *                   调用方请用 `inviteUrlMode(base)` 推断，别凭记忆写布尔。
  * @returns 最终邀请链接；base 为空 → 空串（调用方据此提示「拿不到可分享地址」）
+ * @throws  形态与 base 不符时抛错（稳定形态的 base 路径里没房号、普通形态的 base 已带房号），
+ *           把「脚枪式静默畸形」变成「当场失败」，由单测覆盖。
  */
-export function composeInviteUrl(base: string, roomId: number, extraQuery = "", roomInPath = false): string {
+export function composeInviteUrl(base: string, roomId: number, extraQuery: string, mode: InviteUrlMode): string {
   if (!base) return "";
-  // 稳定入口形态：房号已在路径 /<sid>/join/<roomId> 里，**不再**拼 ?room=（保持 Issue #11 的链接形状）
-  if (roomInPath) return base;
+  if (mode === "stable-entry") {
+    // 稳定入口形态：房号必须已在路径 /<sid>/join/<roomId> 里，**不再**拼 ?room=（保持 Issue #11 的链接形状）
+    if (!hasExplicitRoomInPath(base)) throw new Error("composeInviteUrl: 稳定入口形态要求房号在 base 路径里（/<sid>/join/<roomId>）");
+    return base;
+  }
+  if (hasExplicitRoomInPath(base)) {
+    throw new Error("composeInviteUrl: 普通形态的 base 不应已带房号路径（该走稳定入口形态）");
+  }
   return buildInviteUrl(base, roomId, extraQuery);
 }

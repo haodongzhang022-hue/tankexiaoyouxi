@@ -9,7 +9,7 @@ import { EndlessMode } from "./modes/EndlessMode";
 import { StageMode } from "./modes/StageMode";
 import { DpsTestMode } from "./modes/DpsTestMode";
 import { OnlineHostMode } from "./modes/OnlineHostMode";
-import { parseInviteRoom, buildLobbyUrl as buildLobbyUrlPure, composeInviteUrl } from "./net/InviteLink";
+import { parseInviteRoom, buildLobbyUrl as buildLobbyUrlPure, composeInviteUrl, inviteUrlMode } from "./net/InviteLink";
 import { classifyJoinError, joinErrorText, inviteJoinErrorText } from "./net/JoinError";
 import { NetClient } from "./net/NetClient";
 import { RtcPeer, ICE_SERVERS } from "./net/RtcPeer";
@@ -515,7 +515,13 @@ function buildInviteUrl(roomId: number): string {
   const { base, extra, roomInPath } = shareBase(roomId);
   // 成形规则见 InviteLink.composeInviteUrl（稳定入口形态下房号在路径里、不再拼 ?room=）；
   // 抽成纯函数是为了让这条关键行为有 **入库单测** 兜底（Issue #16 🟢，此前只活在 e2e 脚本里）。
-  return composeInviteUrl(base, roomId, extra, roomInPath);
+  // 形态由 inviteUrlMode 从 base 推断并校验（评审打回：不再手传布尔，漏传会当场抛错而非静默畸形）。
+  const mode = inviteUrlMode(base);
+  if (roomInPath !== (mode === "stable-entry")) {
+    // shareBase 的标记与 base 实际形状不符 —— 立即报错，别把畸形链接发给玩家
+    throw new Error(`shareBase 形态不一致：roomInPath=${roomInPath} 但 base=${JSON.stringify(base)}`);
+  }
+  return composeInviteUrl(base, roomId, extra, mode);
 }
 
 /**

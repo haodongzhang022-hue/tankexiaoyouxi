@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseInviteRoom, buildInviteUrl, buildLobbyUrl, isValidRoomId, composeInviteUrl } from "./InviteLink";
+import { parseInviteRoom, buildInviteUrl, buildLobbyUrl, isValidRoomId, composeInviteUrl, inviteUrlMode, hasExplicitRoomInPath } from "./InviteLink";
 
 describe("parseInviteRoom：房间号绑定", () => {
   it("带房间号 → 返回桌号（好友直接坐进该桌）", () => {
@@ -125,39 +125,61 @@ describe("buildLobbyUrl：生成大厅链接（不带房间号）", () => {
 //  此前这条行为只活在 scripts/e2e/ 的真机脚本里（云端 CI 看不到）。
 //  这里把它锁进 vitest（CI 门禁跑），谁删了 roomInPath 分支就红。
 describe("composeInviteUrl：稳定入口形态 vs 普通形态（Issue #16 🟢 入库兜底）", () => {
-  it("稳定入口形态（roomInPath）→ 房号已在路径里，**不再**拼 ?room=", () => {
+  const STABLE = "https://game.example.com/aabbccdd/join/7";
+
+  it("稳定入口形态（stable-entry）→ 房号已在路径里，**不再**拼 ?room=", () => {
     // 服务器 302 后的形状：/<sid>/join/<roomId>
-    const base = "https://game.example.com/aabbccdd/join/7";
-    expect(composeInviteUrl(base, 7, "", true)).toBe(base);
-    expect(composeInviteUrl(base, 7, "", true)).not.toContain("room=");
+    expect(composeInviteUrl(STABLE, 7, "", "stable-entry")).toBe(STABLE);
+    expect(composeInviteUrl(STABLE, 7, "", "stable-entry")).not.toContain("room=");
   });
 
   it("稳定入口形态 + 有额外参数 → 额外参数被忽略（房号已在路径，勿再引入 query 歧义）", () => {
-    const base = "https://game.example.com/aabbccdd/join/7";
-    expect(composeInviteUrl(base, 7, "server=ws%3A%2F%2F1.2.3.4%3A3001", true)).toBe(base);
+    expect(composeInviteUrl(STABLE, 7, "server=ws%3A%2F%2F1.2.3.4%3A3001", "stable-entry")).toBe(STABLE);
   });
 
-  it("普通形态（roomInPath=false）→ 走 buildInviteUrl，拼出 ?room=", () => {
-    expect(composeInviteUrl("https://game.example.com/", 7, "", false))
+  it("普通形态（plain）→ 走 buildInviteUrl，拼出 ?room=", () => {
+    expect(composeInviteUrl("https://game.example.com/", 7, "", "plain"))
       .toBe("https://game.example.com/?room=7");
-    expect(composeInviteUrl("https://game.example.com/", 7))
-      .toBe("https://game.example.com/?room=7");       // 默认就是普通形态
   });
 
   it("普通形态保留额外参数（含 server= 时用 & 拼接）", () => {
-    expect(composeInviteUrl("https://game.example.com/", 7, "server=ws%3A%2F%2F1.2.3.4%3A3001", false))
+    expect(composeInviteUrl("https://game.example.com/", 7, "server=ws%3A%2F%2F1.2.3.4%3A3001", "plain"))
       .toBe("https://game.example.com/?server=ws%3A%2F%2F1.2.3.4%3A3001&room=7");
   });
 
   it("base 为空 → 空串（调用方据此提示「拿不到可分享地址」）", () => {
-    expect(composeInviteUrl("", 7, "", true)).toBe("");
-    expect(composeInviteUrl("", 7, "", false)).toBe("");
+    expect(composeInviteUrl("", 7, "", "stable-entry")).toBe("");
+    expect(composeInviteUrl("", 7, "", "plain")).toBe("");
   });
 
-  it("稳定入口形态的链接能被 parseInviteRoom 还原（闭环：房号在路径里靠 302 补 ?room）", () => {
-    // 服务器 302 到 /<sid>/join/<roomId>?room=<roomId> 后，search 里就带上了房号
-    const base = "https://game.example.com/aabbccdd/join/7";
-    expect(composeInviteUrl(base, 7, "", true)).toBe(base);
-    expect(parseInviteRoom("?room=7")).toBe(7);
+  it("闭环：稳定入口形态产出 → 服务器 302 补 ?room= → parseInviteRoom 还原出同一桌号", () => {
+    // 服务器 302 到 `<target>/?room=<roomId>`（server/index.mjs，路径回到根，**不保留** /join/），
+    // 所以这里把 composeInviteUrl 的返回值先过一遍 redirectTo 的等价拼装，再喂给 parseInviteRoom。
+    const invited = composeInviteUrl(STABLE, 7, "", "stable-entry");
+    const redirected = `${new URL(invited).origin}/?room=7`;      // 等价 server/index.mjs:367
+    expect(new URL(redirected).pathname).toBe("/");               // 路径回根，不再带 /join/
+    expect(parseInviteRoom(new URL(redirected).search)).toBe(7);  // 房号真的被还原出来
+  });
+
+  // ── 评审打回 3：默认值脚枪 → 形态必须显式传，且与 base 形状不符要当场抛错 ──
+  it("形态与 base 不符 → 抛错（不再静默产出双房号畸形链接）", () => {
+    // 脚枪场景：稳定 base 却按普通形态拼 → 会得到 `/<sid>/join/7?room=7`
+    expect(() => composeInviteUrl(STABLE, 7, "", "plain")).toThrow(/稳定入口形态/);
+    // 反向：普通 base 却声明成稳定形态
+    expect(() => composeInviteUrl("https://game.example.com/", 7, "", "stable-entry")).toThrow(/稳定入口形态/);
+  });
+
+  it("inviteUrlMode 由 base 推断形态（调用方不再手写布尔）", () => {
+    expect(inviteUrlMode(STABLE)).toBe("stable-entry");
+    expect(inviteUrlMode("https://game.example.com/aabbccdd/join/")).toBe("plain"); // 尾房号为空 ≠ 已带房号
+    expect(inviteUrlMode("https://game.example.com/")).toBe("plain");
+    expect(inviteUrlMode("http://1.2.3.4:3001/aabbccdd/join/12?server=x")).toBe("stable-entry");
+  });
+
+  it("hasExplicitRoomInPath：只认 `/<sid>/join/<roomId>`，且房号不能为空", () => {
+    expect(hasExplicitRoomInPath(STABLE)).toBe(true);
+    expect(hasExplicitRoomInPath("https://game.example.com/aabbccdd/join/")).toBe(false);
+    expect(hasExplicitRoomInPath("https://game.example.com/")).toBe(false);
+    expect(hasExplicitRoomInPath("")).toBe(false);
   });
 });
