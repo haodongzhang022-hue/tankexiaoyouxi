@@ -1,46 +1,34 @@
-# 腾讯 CNB 云原生开发流水线 —— 云原生开发当「临时服务器 + 临时公网入口」
+# 腾讯 CNB 流水线 —— 只做 **CI 门禁**（云端不构建运行环境），跑起来的游戏在本地
 #
-# 【先回答"云原生能不能做网络测试"】能。云原生开发的端口预览就是平台分配的公网入口
-#   （页面 + WebSocket 同源，一个地址即可联机），所以**可以用它先把延迟测出来**，
-#   不必先买腾讯云 ECS。本流水线：npm ci + build + 起服务器（0.0.0.0:3001）+ 自检 + 落盘预览地址。
+# 【本项目的分工（用户口径，2026-09-19 定）】
+#   · 云端（CNB）：改代码 + 跑门禁（tsc / build / vitest / net:entry-test）+ 出 PR；
+#   · 本地：起服务器、真机点、真机跑 e2e —— 云 CPU 不够用，跑环境的事一律放本地。
 #
-# 【不能干什么】不能当长期游戏入口：
-#     · <环境ID> 每次环境重建都会变 → 分享出去的链接很快失效；
-#     · 环境被回收后链接直接打不开（关页 10 分钟无操作 / 最长 18h / 凌晨 4-6 点强制）；
-#     · 域名是通配的，环境不存在时一律 302 跳回 cnb.cool
-#       —— 上次"点进去是写代码的网站、不是游戏"就是这个原因（环境已经被回收了）。
-#   → 长期固定入口见 deploy/README.md（Docker / 腾讯云轻量，http://<IP>:3001 重启不变）。
+#   所以这里**没有**「云原生开发当临时服务器/临时公网入口」那一段了。
+#   要起环境请在本机：`npm run online`（起服务器 3001，本机/局域网直接开玩）
+#                   `npm test`     （门禁四件套）
+#                   `sh scripts/e2e/run-verify.sh`（真机 e2e，需下载 Chromium，**只在本地跑**）
+#   长期固定公网入口见 deploy/README.md（Docker / 云主机，http://<IP>:3001 重启不变）。
 #
-# 【怎么测延迟（3 步）】
-#   1. 分支页点「云原生开发」→ 自动装依赖 + 构建 + 起服务器 + 自检 + 实测延迟，
-#      并把预览地址写到 /tmp/tank-public-url.txt（阶段日志里直接可见自检与延迟数字）；
-#   2. IDE 终端跑 `npm run net:tunnel -- --test`（自动探测地址是不是游戏服务 + 实测延迟）；
-#      拿不到就 `cat /tmp/tank-public-url.txt`，或用 WebIDE 的 PORTS 面板映射 3001；
-#   3. 把地址发给好友一起测（若跳 cnb.cool = 环境已回收，重新起一次环境即可）。
-#
-# 注意：
-#   - 服务必须监听 0.0.0.0（server/index.mjs 默认如此），只听 127.0.0.1 预览代理回源不到；
-#   - 本文件必须在**目标分支自身**存在，否则该分支的「云原生开发」起不来；
-#   - 【稳定链接 v3.0】服务器启动后会打印「稳定链接」`<当前域名>/<sid>/join/<房间号>`：
-#     域名/IP 变了由服务器 302 自动匹配，链接不用改；同一进程内 sid 恒定，重启/环境重建才换新。
-#     自测：npm run net:entry-test（16/16；已接入门禁 —— vscode 与 issue 两条流水线都跑）
-#   - 【入口只信可信来源 v3.0.2】「当前入口」**不采信进站请求的 Host**（Host 可伪造，会被劫持成钓鱼链接）。
-#     优先级：① 带一次性令牌的**显式登记**（GET /entry/register?url=<IP 或域名>，令牌在
-#     $TANK_ENTRY_TOKEN_FILE，默认 /tmp/tank-entry-<port>.token，0600；登记结果落盘 .url，重启后仍在）
-#     → ② 平台预览模板（经同口径校验，含残留占位符一律作废）→ ③ 保持现有入口。
-#     **IP 形态部署（无域名）同样可登记**：http://203.0.113.9:3001 / http://192.168.1.50:3001 都能当入口；
+# 【历史坑位（仍然适用，勿回退）】
+#   · 服务必须监听 0.0.0.0（server/index.mjs 默认如此），只听 127.0.0.1 时端口预览/反代回源不到；
+#   · 【稳定链接 v3.0】服务器启动后打印「稳定链接」`<当前域名>/<sid>/join/<房间号>`：
+#     域名/IP 变了由服务器 302 自动匹配；同一进程内 sid 恒定，重启/换环境才换新。
+#     自测：npm run net:entry-test。
+#   · 【入口只信可信来源 v3.0.2】「当前入口」**不采信进站请求的 Host**（Host 可伪造 → 钓鱼链接）。
+#     优先级：① 带一次性令牌的显式登记（GET /entry/register?url=<IP 或域名>，令牌在
+#     $TANK_ENTRY_TOKEN_FILE，默认 /tmp/tank-entry-<port>.token，0600；登记结果落盘 .url）
+#     → ② 平台预览模板（含残留占位符一律作废）→ ③ 服务器自己找的本机入口。
+#     **IP 形态部署同样可登记**：http://203.0.113.9:3001 / http://192.168.1.50:3001 都能当入口；
 #     没有任何入口时给可操作提示页，**绝不**把好友 302 到 127.0.0.1（那会指向他自己机器）。
-#     换域名/换 IP 后跑一次 `npm run net:tunnel -- --entry=http://<新地址>:3001` 即可（deploy/start-server.sh 已内置）。
-#   - 【玩家开箱可玩 v3.0.3】入口**不需要任何手动前置**：服务器启动时自己找一次（TANK_PUBLIC_ENTRY →
-#     本机公网出口 IP → 局域网 IP）并落盘，打开就玩；显式令牌登记优先级仍最高。TANK_AUTO_ENTRY=0 可关。
-#   - 【/entry/localtip 准入加固 v3.0.4（Issue #15 🔴）】可达性上报此前**无令牌**即可改写全局入口并落盘
-#     —— 一条匿名 curl `?origin=http://phish.example.net` 就把分享链接 302 到攻击者域名（与 PR #7 评审
-#     🔴1 的 Host 伪造同源；旧防护「只在已有登记入口时才接受修正」因**启动即自动登记 LAN IP 而恒为真**）。
-#     现在只放行两种：① 带一次性令牌（部署者显式自救）；② **本机/同内网自救** —— 上报地址必须是
-#     **服务器自己网卡的 IP**（LAN_IPS）且 TCP 对端来自私网/回环。任意公网域名/公网 IP → 403 且入口不变。
-#     公网侧玩家被拒后**照旧就地开玩**（前端已把当前地址落成本地稳定入口），只是不再让单个玩家的网络
-#     状况改写所有人的全局入口（刻意的可用性取舍）。自测：npm run net:entry-test（24/24）。
-#   - 这里的 stages 只装依赖/构建/起服务/自测，不要占用 3001，避免与服务器抢端口。
+#   · 【玩家开箱可玩 v3.0.3】入口不需要任何手动前置：服务器启动自己找一次并落盘，打开就玩。
+#     TANK_AUTO_ENTRY=0 可关。
+#   · 【/entry/localtip 准入加固 v3.0.4（Issue #15 🔴）】可达性上报只放行：① 带一次性令牌；
+#     ② 本机/同内网自救（上报地址 = 服务器自己网卡的 IP + 私网/回环对端）。其余一律 403 且入口不变。
+#     自测：npm run net:entry-test。
+#   · 【error 帧机器码 v2.41（Issue #16 D1）】加入房间失败的 error 帧带 `code`
+#     （room_full / room_not_found / room_playing …），前端按码决定"要不要重试"，文案只做展示。
+#     契约在 shared/net-error-codes.mjs，判定在 src/net/JoinError.ts，两端各有一条回归锁。
 #
 # ⚠⚠ 阶段脚本两个「真机踩过」的坑（改本文件前必读，勿回退）：
 #
@@ -62,175 +50,55 @@
 #     平台把整段脚本作为 `sh -c "<脚本文本>"` 执行，该 shell 的**命令行里就含脚本文本**；
 #     `pkill -f "node server/index.mjs"` 因此匹配到自身 → 自己给自己 SIGTERM →
 #     stage 以 `code 143`（signal SIGTERM）秒失败，且**看不到任何后续输出**。
-#     → 本文件**不再用 `pkill -f`**：改用「先探 /healthz 复用、否则按 PID 文件收旧进程」，
-#       既不误杀自己，也不会重复起进程。
-$:
-  vscode:
-    - runner:
-        cpus: 4
-      docker:
-        image: node:20
-      services:
-        - vscode
-        - docker
-      env:
-        PORT: "3001"
-        HOST: "0.0.0.0"
-      stages:
-        - name: install-deps
-          script: npm ci
-        - name: build-dist
-          script: npm run build
-        - name: stable-entry-regression
-          # 稳定入口回归锁（Issue #11 评审 🟡2：不进门禁的锁必腐）。
-          # 真起服务器 + 真发 HTTP，覆盖：IP 形态登记 → 302 到该 IP、伪造 Host 不得改写入口、
-          # 模板残留占位符不得成为入口、显式登记优先级、令牌 0600 + 不跟随符号链接、
-          # **Issue #15：匿名 /entry/localtip 不得改写入口（403 + 入口不变 + 不落盘）**。
-          script: npm run net:entry-test
-        - name: start-tank-server
-          # 块标量单条脚本：无 `&&` 拼接、后台启动在子 shell 里、不 pkill 自匹配。
-          script: |
-            set -u
-            if curl -sf -o /dev/null --max-time 3 http://127.0.0.1:3001/healthz; then
-              echo "[start] 3001 已有健康服务，复用现有进程"
-            else
-              if [ -f /tmp/tank-server.pid ]; then
-                old=$(cat /tmp/tank-server.pid 2>/dev/null || true)
-                if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
-                  kill "$old" 2>/dev/null || true
-                  sleep 1
-                fi
-              fi
-              echo "[start] 启动服务器（0.0.0.0:3001）"
-              (nohup node server/index.mjs > /tmp/tank-server.log 2>&1 & echo $! > /tmp/tank-server.pid)
-              sleep 2
-            fi
-            echo "── 服务器启动日志 ──"
-            cat /tmp/tank-server.log 2>/dev/null || true
-            code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3001/ || true)
-            echo "本机 3001 自检 HTTP=$code"
-            if [ "$code" = "200" ]; then
-              echo "本机 3001 就绪 OK"
-            else
-              echo "服务器未就绪（stage 失败，避免「环境起来了但服务没起」）"
-              cat /tmp/tank-server.log 2>/dev/null || true
-              exit 1
-            fi
-            if [ -f /tmp/tank-public-url.txt ]; then
-              echo "公网预览地址(临时·仅自测): $(cat /tmp/tank-public-url.txt)"
-            else
-              echo "未拿到端口预览地址（本 stage 无平台变量属正常）"
-              echo "请在云原生开发环境的 IDE 终端执行: npm run net:tunnel"
-              echo "或直接在 WebIDE 的 PORTS 面板映射 3001"
-            fi
-            # 验收证据：实测延迟（有公网入口就出公网数字，没有就出本机基线）。
-            # 自测步骤，失败不阻断（|| true）+ 超时兜底，绝不把「云原生开发」打挂。
-            echo "── 延迟实测（公网入口 + 本机回环基线）──"
-            timeout 180 npm run net:tunnel -- --test || true
+#     → 本文件**不用 `pkill -f`**：改用「先探 /healthz 复用、否则按 PID 文件收旧进程」。
+#
+#   坑 3｜**别在 `issue.comment@npc` 里起长驻服务**（NPC 任务的载体就是这条流水线）
+#     在里面 `nohup` 常驻进程 = 把模型和后台服务塞进同一容器同一会话 → 抢资源、
+#     stage 收不了尾、整条流水线最后被平台掐掉（实测最长 error 构建 1h37.5m，
+#     `npc go` 独占 5839738ms，报 `Pipeline has been stopped, Agent aborted`）。
+#     → NPC 事件流水线**只留给 NPC**；要验证"服务器 + 联机 + 延迟"请在本机跑。
+#     本项目 NPC 行为走平台内置 npc:go（镜像 cnbcool/default-npc:latest），
+#     不依赖本文件声明 issue.comment@npc；若确需定制，骨架只放 `type: npc:go`，不放起服务。
 
-# ── Issue/PR 里 @NPC 触发：起服务 + 自检 + 延迟报告，可复现 ──
-# 触发：在本仓库 Issue/PR 评论里 @CodeBuddy（npc 事件），本流水线自动跑一遍。
-# 脚本写法同上（块标量 + 子 shell 后台启动 + 不用 pkill -f），规避上面两个坑。
-issue.comment@npc:
-  - runner:
-      cpus: 4
-    docker:
-      image: node:20
-    env:
-      PORT: "3001"
-      HOST: "0.0.0.0"
-    stages:
+# ── CI 门禁：纯校验，不起常驻服务、不下载浏览器 ──
+# 触发：pull_request（PR 创建/重新打开/源分支 push）→ 每个 PR 都有一道门。
+# 取 4 核（默认 8 核 16G 属"高负载"，本仓库门禁是纯 CPU 轻活，省核）→ 对齐用户"云 CPU 不够用"。
+# 跑什么：npm ci → tsc → vite build → vitest → net:entry-test（纯 node --test，自起服务器自选随机端口）。
+# 不跑什么：真机 e2e（要下 Chromium ~400MB + 三个服务）、延迟实测 —— 那是**本地**的事。
+main:
+  pull_request:
+   - runner:
+       cpus: 4
+     docker:
+       image: node:20
+     stages:
       - name: install-deps
         script: npm ci
+      - name: typecheck
+        script: npx tsc --noEmit
       - name: build-dist
         script: npm run build
+      - name: unit-tests
+        # 入库单测：InviteLink / JoinError（error 帧机器码判定）/ RtcPeer / sync-core
+        script: npx vitest run
       - name: stable-entry-regression
-        # 稳定入口回归锁：纯 node --test（自起服务器、自选随机端口，不占用 3001）
+        # 稳定入口 + error 帧机器码的回归锁（真起服务器、真发 HTTP/WebSocket，随机端口）
         script: npm run net:entry-test
-      - name: start-server-and-selfcheck
-        script: |
-          set -u
-          if curl -sf -o /dev/null --max-time 3 http://127.0.0.1:3001/healthz; then
-            echo "[start] 3001 已有健康服务，复用现有进程"
-          else
-            if [ -f /tmp/tank-server.pid ]; then
-              old=$(cat /tmp/tank-server.pid 2>/dev/null || true)
-              if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
-                kill "$old" 2>/dev/null || true
-                sleep 1
-              fi
-            fi
-            echo "[start] 启动服务器（0.0.0.0:3001）"
-            (nohup node server/index.mjs > /tmp/tank-server.log 2>&1 & echo $! > /tmp/tank-server.pid)
-            sleep 2
-          fi
-          echo "── 服务器启动日志 ──"
-          cat /tmp/tank-server.log 2>/dev/null || true
-          code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3001/ || true)
-          ws=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:3001/?room=1" || true)
-          echo "本机 3001 自检: / => $code, /?room=1 => $ws"
-          if [ "$code" = "200" ]; then
-            echo "本机 3001 就绪 OK"
-          else
-            echo "服务器未就绪"
-            exit 1
-          fi
-      - name: tunnel-latency-report
-        script: |
-          set -u
-          # 兜底：万一服务在阶段间被回收，先确保它在（复用同一套安全启动写法）
-          if ! curl -sf -o /dev/null --max-time 3 http://127.0.0.1:3001/healthz; then
-            (nohup node server/index.mjs > /tmp/tank-server.log 2>&1 & echo $! > /tmp/tank-server.pid)
-            sleep 2
-          fi
-          echo "── 服务身份 ──"
-          curl -s http://127.0.0.1:3001/__whoami || true
-          echo
-          curl -s http://127.0.0.1:3001/healthz || true
-          echo
-          echo "── 预览地址 + 实测延迟（--test 已含身份探测）──"
-          timeout 180 node scripts/net-tunnel.mjs --test || true
+# 说明：不再为 `pull_request.update` 再挂一条重复流水线 —— 门禁只跑一条，
+# 改标题/描述不需要重跑构建（省云 CPU）。要手动重跑，用 PR 页面的「重新构建」。
 
-  # ── Issue/PR 里 @NPC：**不要**在这里起服务器 / 测延迟（会拖死 NPC 任务，见下）──
-  #
-  # ❌ 已删除的历史写法（v4 及之前在这里挂过一段 `issue.comment@npc:`）：
-  #      - name: start-server-and-selfcheck
-  #        script: |
-  #          (nohup node server/index.mjs > /tmp/tank-server.log 2>&1 & echo $! > /tmp/tank-server.pid)
-  #          timeout 180 node scripts/net-tunnel.mjs --test || true
-  #
-  #   它本身语法没问题（挂进 `$` 是对的），问题是**语义错了**：`issue.comment@npc`
-  #   的流水线不只是给 NPC 一个跑测试的环境，它本身就是**那个 NPC 任务的执行载体**。
-  #   在这里起一个长驻 node 进程，等于把模型和它的任务一起塞进同一个容器的同一个 shell 会话里：
-  #     · 服务器常驻 → 该 stage 永不结束 → NPC 事件拿不到干净收尾；
-  #     · 子 shell 后台进程与 Agent 的每条 bash 命令共用同一进程组/同一会话，
-  #       一旦 Agent 自己的命令超时被平台杀，后台服务跟着一起没；
-  #     · 更要命的是它和 NPC 的 CLI/技能、WebSocket、以及同镜像里的其他常驻进程**抢同一套资源**
-  #       （node 事件循环 / fd / 内存 / 3001 端口 / 共享的 .probe 与 tests 环境），
-  #       表现为「任务越跑越慢 → 后到的请求也没人处理 → 最后整条流水线被平台掐掉」。
-  #   实测（本仓库自证，可复现）：`get-build-logs --event issue.comment@npc` 里标注 success
-  #   的构建 duration 从 49s 一路涨到 639s；而完整版（带 vscode 全流程 + 延迟实测）的
-  #   2 次跑到 2143s / 3308s。最长的一条 error 构建（cnb-iii-1k2q8er4i）duration=5849141ms
-  #   ≈ 1h37.5m，stage `npc go` 独占 5839738ms，报错为
-  #   `[LLM request error ...] Pipeline has been stopped, Agent aborted`：
-  #   不是"任务太长"，是 **Agent 被平台超时中止**（与用户观察的 1h36m 完全吻合）。
-  #
-  # ✅ 正确做法：
-  #     · NPC 事件流水线**只留给 NPC**：不要起长驻服务、不要跑长耗时压测/延迟实测；
-  #     · 想验证"服务器 + 联机 + 延迟"这类副作用，走**独立事件**：
-  #       - `vscode:`（云原生开发，本文件上方那段）：起服务 + 自检 + 延迟实测，专人专线；
-  #       - 或 `push` / `web_trigger:` 专门跑一条构建，产出物/日志当证据；
-  #     · 需要给 NPC 一份环境时，用 `services:` 声明配套服务（平台托管生命周期），
-  #       而**不是**在 stage 里 `nohup` 一个和 Agent 抢资源的进程。
-  #
-  # 触发说明：本项目 NPC 事件走**平台内置的 npc:go**（镜像 cnbcool/default-npc:latest），
-  # 不依赖本文件再声明 `issue.comment@npc`；本文件里的 `issue.comment@npc` 一旦存在，
-  # 平台会**额外**按这里的内容再跑一条 Pipeline（所以上面那段才成了"罪魁"）。
-  # 若后续确需定制 NPC 行为，正确骨架长这样（注意 stages 里只有 npc:go，没有起服务）：
-  #
-  #   issue.comment@npc:
-  #     - docker:
-  #         image: cnbcool/default-npc:latest
-  #       stages:
-  #         - name: npc go
-  #           type: npc:go
+# ── Issue/PR 里 @NPC 触发：只给 NPC 环境，不起任何常驻服务 ──
+# 触发：在本仓库 Issue/PR 评论里 @CodeBuddy（npc 事件）。
+# ⚠ 这里**刻意什么都不配置**：本项目的 NPC 行为走平台内置 npc:go，
+#   而"在 NPC 事件里起服务器"正是历史上把任务拖到 1h37m 被平台掐掉的根因（见文件头「坑 3」）。
+#   需要给 NPC 一份环境时，用 `services:` 声明配套服务（平台托管生命周期），
+#   而**不是**在 stage 里 `nohup` 一个和 Agent 抢资源的进程。
+#
+# 若后续确需定制 NPC 行为，正确骨架长这样（注意 stages 里只有 npc:go，没有起服务）：
+#
+#   issue.comment@npc:
+#     - docker:
+#         image: cnbcool/default-npc:latest
+#       stages:
+#         - name: npc go
+#           type: npc:go

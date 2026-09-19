@@ -689,3 +689,116 @@ test("🔴 回归（Issue #11）：没有任何登记入口时，可达性上报
   assert.ok(r2.status >= 400, "回环地址仍不得成为入口");
   assert.equal((await health(s.base)).current, "http://203.0.113.9:3001", "被拒时入口保持不变");
 });
+
+// ── Issue #16（D1）：error 帧的**机器码**契约 ────────────────────
+// 病根：前端靠 `msg.includes("已满")/("不存在")/("对局中")` 决定"要不要重试"，
+//      服务端一改文案（本地化/加前缀）前端就静默退化（「对局中」丢掉重试能力）。
+// 修法：服务端 error 帧带 `code` 机器码（shared/net-error-codes.mjs），前端按码分档，文案只做展示。
+// 本测试**真起服务器 + 真发 WebSocket**，锁住"加入房间三条错误路径的 code 不许改/不许丢"。
+
+/** 连上服务器，等 welcome，返回一个极简的收发器 */
+async function connect(port) {
+  const { WebSocket } = await import("ws");
+  const ws = new WebSocket(`ws://127.0.0.1:${port}`);
+  const inbox = [];
+  const waiters = [];
+  ws.on("message", (raw) => {
+    const m = JSON.parse(String(raw));
+    inbox.push(m);
+    for (let i = waiters.length - 1; i >= 0; i--) {
+      if (waiters[i].pred(m)) { waiters.splice(i, 1)[0].res(m); }
+    }
+  });
+  await new Promise((res, rej) => { ws.once("open", res); ws.once("error", rej); });
+  const waitFor = (pred, ms = 5000) => {
+    const hit = inbox.find(pred);
+    if (hit) return Promise.resolve(hit);
+    return new Promise((res, rej) => {
+      const to = setTimeout(() => rej(new Error("等消息超时")), ms);
+      waiters.push({ pred, res: (m) => { clearTimeout(to); res(m); } });
+    });
+  };
+  return {
+    ws,
+    inbox,
+    send: (o) => ws.send(JSON.stringify(o)),
+    welcome: () => waitFor((m) => m.t === "welcome"),
+    waitFor,
+    /** 发一条消息，等它换来的 error 帧（收不到则抛，避免"undefined.code"这种误导性失败） */
+    async expectError(o) {
+      const n = inbox.length;
+      ws.send(JSON.stringify(o));
+      const hit = await waitFor((m) => m.t === "error" && inbox.indexOf(m) >= n);
+      return hit;
+    },
+    close: () => ws.close(),
+  };
+}
+
+test("🔴 回归（Issue #16 D1）：加入房间的 error 帧必须带机器码（前端据此分档，不再耦合中文文案）", async (t) => {
+  const s = await startServer();
+  t.after(() => s.stop());
+  const { ERR_ROOM_NOT_FOUND, ERR_ROOM_FULL, ERR_ROOM_PLAYING, ERR_ALREADY_IN_TABLE } =
+    await import("../../shared/net-error-codes.mjs");
+
+  // ① 房间不存在
+  const a = await connect(s.port);
+  await a.welcome();
+  const e1 = await a.expectError({ t: "join", tableId: 99999 });
+  assert.equal(e1.code, ERR_ROOM_NOT_FOUND, "房间不存在必须带 code=room_not_found");
+  assert.ok(e1.msg, "文案仍要保留（给玩家看）");
+
+  // ② 房主建房 + 已在桌内的 join 错误
+  a.send({ t: "create", mode: "endless" });
+  const created = await a.waitFor((m) => m.t === "table" && m.table.seats[0] && m.table.seats[0].clientId);
+  const roomId = created.table.id;
+  const e2 = await a.expectError({ t: "join", tableId: roomId });
+  assert.equal(e2.code, ERR_ALREADY_IN_TABLE);
+
+  // ③ 房间已满：房主 + 3 名成员 == 4 座，第 5 人必须被拒
+  const members = [];
+  for (let i = 0; i < 3; i++) {
+    const m = await connect(s.port);
+    await m.welcome();
+    m.send({ t: "join", tableId: roomId });
+    members.push(m);
+  }
+  // 4 座全占（房主 + 3 成员）后再进第 5 人；等**服务器真的把桌坐满**再发，
+  // 否则 join 可能先于第 3 个成员的入座处理，拿到的是"还没满"的假结论。
+  await a.waitFor((x) => x.t === "table" && x.table.seats.filter(Boolean).length >= 4, 6000);
+  const fifth = await connect(s.port);
+  await fifth.welcome();
+  const e3 = await fifth.expectError({ t: "join", tableId: roomId });
+  assert.equal(e3.code, ERR_ROOM_FULL, "坐满时第 5 人必须拿到 code=room_full");
+
+  // ④ 房间对局中：4 人全部准备 → 房主开局 → 后到的人拿到唯一"值得重试"的码
+  // 所有人准备（房主自带 1 座，房主自己不需要准备）
+  for (const m of members) m.send({ t: "ready", value: true });
+  await a.waitFor((x) => x.t === "table" && x.table.seats.filter(Boolean).every((z) => z.clientId === created.table.seats[0].clientId || z.ready), 6000);
+  a.send({ t: "start" });
+  await a.waitFor((x) => x.t === "start", 6000);
+  const late = await connect(s.port);
+  await late.welcome();
+  const e4 = await late.expectError({ t: "join", tableId: roomId });
+  assert.equal(e4.code, ERR_ROOM_PLAYING, "开局后进房必须拿到 code=room_playing（前端据此重试）");
+
+  for (const c of [a, ...members, fifth, late]) c.close();
+});
+
+test("🔴 回归（Issue #16 D1）：机器码常量与前端判定表同值（前后端同一套契约）", async () => {
+  const m = await import("../../shared/net-error-codes.mjs");
+  // 与 src/net/JoinError.ts 里导出的常量保持一致（前端是 TS、服务端是 mjs，两边都从这里对齐）
+  assert.equal(m.ERR_ROOM_NOT_FOUND, "room_not_found");
+  assert.equal(m.ERR_ROOM_FULL, "room_full");
+  assert.equal(m.ERR_ROOM_PLAYING, "room_playing");
+  // 唯一可重试的码 = room_playing（与前端 classifyJoinError 的 retry 口径一致）
+  assert.deepEqual([...m.RETRYABLE_JOIN_CODES], ["room_playing"]);
+  assert.equal(m.isRetryableJoinCode("room_playing"), true);
+  assert.equal(m.isRetryableJoinCode("room_full"), false);
+  assert.equal(m.isRetryableJoinCode(undefined), false);
+  // 前端源码里必须是按 code 分档、且**不再**把关键词当主路径
+  const fs = await import("node:fs");
+  const src = fs.readFileSync(new URL("./JoinError.ts", import.meta.url), "utf8");
+  assert.match(src, /kindOfCode/, "JoinError.ts 应有按 code 分档的实现");
+  assert.match(src, /via: "msg"/, "JoinError.ts 应保留（且仅保留）旧服务端关键词兜底");
+});

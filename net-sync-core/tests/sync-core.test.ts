@@ -10,7 +10,7 @@
 import { describe, it, expect } from "vitest";
 import {
   SyncCodec, Interpolator, LatencyTracker, ReconnectManager, pickSuccessorHost,
-  lerpEntity, SyncEngine,
+  lerpEntity, SyncEngine, StableEntryManager, entryPathOf, parseStableEntry,
   type Transport, type SyncState, type EntityRecord,
 } from "../core";
 import { validateSchema } from "../schema";
@@ -306,5 +306,67 @@ describe("SyncEngine（主机→成员全链路：编码→去重→解码→onS
     expect(states[2].kinds.tank[0].x).toBe(50);
     expect(states[2].scope.score).toBe(20);
     expect(host.rtt).toBe(0);
+  });
+});
+
+// ── Issue #16 🟢：稳定入口链接形态**入库**（以前这条断言只活在 scripts/e2e/ 里，CI 看不到）──
+// 形态契约（Issue #11 成果，不得回退）：分享链接 = <入口>/<sid>/join/<roomId>，
+// 房号在**路径**里（不是 ?room=）；不带房号的「大厅链接」= <入口>/<sid>/join/。
+// 这条锁在 CI 里跑（vitest），避免"只有真机 e2e 才发现形态被改坏"。
+describe("稳定入口链接形态（Issue #11 成果的 CI 可见回归锁）", () => {
+  const SID = "a1b2c3d4";
+
+  it("邀请链接把房号放在**路径**里：/<sid>/join/<roomId>", () => {
+    const p = entryPathOf(SID, 7);
+    expect(p).toBe(`/${SID}/join/7`);
+    const full = `http://203.0.113.9:3001${p}`;
+    expect(new URL(full).pathname).toBe(`/${SID}/join/7`);
+    expect(full).not.toContain("?room=");          // 房号不许退化成 query（退化了 302 会丢房号）
+  });
+
+  it("大厅链接不带房号：/<sid>/join/", () => {
+    expect(entryPathOf(SID, null)).toBe(`/${SID}/join/`);
+    expect(entryPathOf(SID)).toBe(`/${SID}/join/`);
+  });
+
+  it("IP 形态入口（无域名）也成立，且协议不被改写", () => {
+    // v3.0.2 评审 🔴2：IP 部署必须能分享；曾经被硬拼成 https:// 而不可用
+    expect(`http://192.168.1.50:3001${entryPathOf(SID, 3)}`).toBe(`http://192.168.1.50:3001/${SID}/join/3`);
+  });
+
+  it("sid 不合法 → 空串（调用方退回普通寻址，不生成半截链接）", () => {
+    for (const bad of ["", "xyz", "a1b2c3", "a1b2c3d4e5", "A1B2C3D4Z"]) {
+      expect(entryPathOf(bad, 7)).toBe("");
+    }
+  });
+
+  it("生成的链接能被 parseStableEntry 原样解析回来（闭环：发起方与接收方同一口径）", () => {
+    for (const room of [null, 1, 7, 99999]) {
+      const url = `https://game.example.com${entryPathOf(SID, room)}`;
+      const card = parseStableEntry(url);
+      expect(card?.sid).toBe(SID);
+      expect(card?.roomId ?? null).toBe(room);
+    }
+  });
+
+  it("parseStableEntry 也认历史写法 /entry/<sid>（旧链接不作废）", () => {
+    expect(parseStableEntry(`https://h/entry/${SID}`)?.sid).toBe(SID);
+    expect(parseStableEntry(`https://h/${SID}/join/?room=5`)?.roomId).toBe(5);
+  });
+
+  it("StableEntryManager.adopt 只接受合法 sid；url 记的是「带房号路径」的形态", () => {
+    const mem = new Map<string, string>();
+    const mgr = new StableEntryManager(
+      { getItem: (k) => mem.get(k) ?? null, setItem: (k, v) => { mem.set(k, v); }, removeItem: (k) => { mem.delete(k); } },
+      "k",
+    );
+    expect(mgr.adopt("bad", "https://h/")).toBeNull();
+    const card = mgr.adopt(SID, `https://h${entryPathOf(SID, 7)}`, 7);
+    expect(card?.sid).toBe(SID);
+    expect(mgr.peek()?.url).toBe(`https://h/${SID}/join/7`);
+    // 服务器换入口后只需换 url，房号仍在路径里（保持同一形态，不断链）
+    const moved = mgr.adopt(SID, `http://198.51.100.7:3001${entryPathOf(SID, 7)}`, 7);
+    expect(moved?.url).toBe(`http://198.51.100.7:3001/${SID}/join/7`);
+    expect(moved?.url).not.toContain("?room=");
   });
 });

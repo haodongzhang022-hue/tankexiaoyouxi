@@ -26,6 +26,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { detectPreviewUrl, writePublicUrl, PUBLIC_URL_FILE } from "../shared/preview-url.mjs";
 // 「稳定入口 ↔ 当前临时地址」自动匹配表（与共享层同一份实现，见 shared/entry-match.mjs）
 import { createEntryMatcher, entryPath, makeSid, SID_RE, ENTRY_TTL_MS, ENTRY_KEEPALIVE_MS, ENTRY_SWEEP_MS, normalizeOrigin, originScope, ipScope, hasTemplatePlaceholder, localTipAllowedFor } from "../shared/entry-match.mjs";
+import { ERR_ROOM_NOT_FOUND, ERR_ROOM_FULL, ERR_ROOM_PLAYING, ERR_ALREADY_IN_TABLE, ERR_HOST_ONLY, ERR_START_PRECONDITION, ERR_NO_REJOIN } from "../shared/net-error-codes.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DIST_DIR = path.resolve(__dirname, "..", "dist");
@@ -905,7 +906,7 @@ function handle(ws, conn, msg) {
   }
 
   if (t === "create") {
-    if (conn.tableId !== null) return sendRaw(ws, { t: "error", msg: "你已在桌内" });
+    if (conn.tableId !== null) return sendRaw(ws, { t: "error", code: ERR_ALREADY_IN_TABLE, msg: "你已在桌内" });
     const mode = msg.mode === "stage" ? "stage" : "endless";
     // 找该模式第一个空桌（0 座）作为新房间；v2.25 无空桌则现场新建（绝不阻塞）
     let target = null;
@@ -926,12 +927,12 @@ function handle(ws, conn, msg) {
   }
 
   if (t === "join") {
-    if (conn.tableId !== null) return sendRaw(ws, { t: "error", msg: "你已在桌内" });
+    if (conn.tableId !== null) return sendRaw(ws, { t: "error", code: ERR_ALREADY_IN_TABLE, msg: "你已在桌内" });
     const table = tables.get(Number(msg.tableId));
-    if (!table) return sendRaw(ws, { t: "error", msg: "房间不存在" });
-    if (table.state === "playing") return sendRaw(ws, { t: "error", msg: "该房间对局中" });
+    if (!table) return sendRaw(ws, { t: "error", code: ERR_ROOM_NOT_FOUND, msg: "房间不存在" });
+    if (table.state === "playing") return sendRaw(ws, { t: "error", code: ERR_ROOM_PLAYING, msg: "该房间对局中" });
     const idx = table.seats.findIndex((s) => s === null);
-    if (idx < 0) return sendRaw(ws, { t: "error", msg: "房间已满" });
+    if (idx < 0) return sendRaw(ws, { t: "error", code: ERR_ROOM_FULL, msg: "房间已满" });
     // 空桌首位进入者自动成为房主（否则无人能开始对局）
     if (table.hostId === -1) {
       table.hostId = conn.id;
@@ -964,7 +965,7 @@ function handle(ws, conn, msg) {
   if (t === "orient") {
     const table = tableOf(conn);
     if (!table || table.state !== "lobby") return;
-    if (conn.id !== table.hostId) return sendRaw(ws, { t: "error", msg: "仅房主可更改房间方向" });
+    if (conn.id !== table.hostId) return sendRaw(ws, { t: "error", code: ERR_HOST_ONLY, msg: "仅房主可更改房间方向" });
     table.orient = msg.orient === "portrait" ? "portrait" : "landscape";
     broadcastTable(table);
     broadcastTables(null);
@@ -973,13 +974,13 @@ function handle(ws, conn, msg) {
 
   if (t === "start") {
     const table = tableOf(conn);
-    if (!table || conn.id !== table.hostId) return sendRaw(ws, { t: "error", msg: "仅房主可开始" });
+    if (!table || conn.id !== table.hostId) return sendRaw(ws, { t: "error", code: ERR_HOST_ONLY, msg: "仅房主可开始" });
     if (table.state !== "lobby") return;
     // v2.5：房主无需准备；其余入座玩家全部准备后才能开始
     const seated = table.seats.map((s, i) => (s ? i : -1)).filter((i) => i >= 0);
-    if (seated.length < 1) return sendRaw(ws, { t: "error", msg: "需要至少 1 人才能开始" });
+    if (seated.length < 1) return sendRaw(ws, { t: "error", code: ERR_START_PRECONDITION, msg: "需要至少 1 人才能开始" });
     const guestsReady = seated.every((i) => table.seats[i].clientId === table.hostId || table.seats[i].ready);
-    if (!guestsReady) return sendRaw(ws, { t: "error", msg: "还有玩家未准备（等待所有人点击准备）" });
+    if (!guestsReady) return sendRaw(ws, { t: "error", code: ERR_START_PRECONDITION, msg: "还有玩家未准备（等待所有人点击准备）" });
     table.state = "playing";
     table.playingSeats = table.seats.map((s) => (s ? s.ws : null));
     if (table.seed == null) table.seed = Math.floor(Math.random() * 1e9);
@@ -997,10 +998,10 @@ function handle(ws, conn, msg) {
     // v2.11 局内重进：对局进行中断线/刷新后凭令牌回到原座位（服务端原样继续广播，无需主机配合）
     const table = tables.get(Number(msg.tableId));
     console.log("[rejoin] req tableId=", msg.tableId, "token=", String(msg.token || "").slice(0, 6), "state=", table?.state, "found=", table ? table.seats.some((s) => s && s.rejoinToken === String(msg.token || "")) : "-");
-    if (!table || table.state !== "playing") return sendRaw(ws, { t: "error", msg: "房间已结束或无进行中对局" });
+    if (!table || table.state !== "playing") return sendRaw(ws, { t: "error", code: ERR_NO_REJOIN, msg: "房间已结束或无进行中对局" });
     const token = String(msg.token || "");
     const seatIdx = table.seats.findIndex((s) => s && s.rejoinToken === token);
-    if (seatIdx < 0) return sendRaw(ws, { t: "error", msg: "重连令牌无效或已失效" });
+    if (seatIdx < 0) return sendRaw(ws, { t: "error", code: ERR_NO_REJOIN, msg: "重连令牌无效或已失效" });
     const s = table.seats[seatIdx];
     s.ws = ws; s.clientId = conn.id;       // 新连接挂回原座位
     conn.tableId = table.id; conn.idx = s.idx;   // 玩家索引（座位下标可能≠玩家索引）

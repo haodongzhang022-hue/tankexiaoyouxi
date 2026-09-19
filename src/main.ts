@@ -10,6 +10,7 @@ import { StageMode } from "./modes/StageMode";
 import { DpsTestMode } from "./modes/DpsTestMode";
 import { OnlineHostMode } from "./modes/OnlineHostMode";
 import { parseInviteRoom, buildInviteUrl as buildInviteUrlPure, buildLobbyUrl as buildLobbyUrlPure } from "./net/InviteLink";
+import { classifyJoinError, joinErrorText } from "./net/JoinError";
 import { NetClient } from "./net/NetClient";
 import { RtcPeer, ICE_SERVERS } from "./net/RtcPeer";
 import type { ServerCandidate } from "./net/NetClient";
@@ -445,7 +446,6 @@ function autoLearnPublicHost() {
   } catch {}
 }
 
-
 /**
  * 可分享的「当前入口 origin」：服务器可信来源确立的入口 > 页面自身域名（排除 localhost）；没有则 ""。
  * v3.0.2：优先用服务器给的**完整 origin**（协议+端口都在里面），这样
@@ -518,7 +518,6 @@ function buildInviteUrl(roomId: number): string {
   if (roomInPath) return base;
   return buildInviteUrlPure(base, roomId, extra);
 }
-
 
 /**
  * 不带房间号的「大厅链接」：好友打开后进大厅，自己选桌/开房（不占座位）。
@@ -1117,26 +1116,24 @@ function wireNetHandlers(): void {
     beginOnlineGame({ myIndex: d.myIndex, mode: d.mode, players: d.players, orient: d.orient });
     notifyOnline("对局重连成功，继续游戏");
   });
-  net.on("error", (msg) => {        // v2.11 重连令牌失效（对局已结束/座位被顶替/房主迁移）→ 清卡回大厅
+  net.on("error", (msg, code) => {  // v2.11 重连令牌失效（对局已结束/座位被顶替/房主迁移）→ 清卡回大厅
     if (peekRejoinCard()) { clearRejoinCard(); notifyOnline(`重连失败：${msg}，已回大厅`); }
     // v2.25 大厅内连接失败（服务器未启动/重启中）→ 自动重试，不把玩家丢回主菜单
     if (state === "online" && !net.connected) { scheduleOnlineReconnect(); return; }
-    // 邀请链接自动进房：可恢复的错误（房间列表尚未同步/座位刚被释放）→ 重试；
-    // 不可恢复（房间不存在 = 邀请链接已失效、房间已满）→ 停止重试并说清原因
+    // 邀请链接自动进房：**按服务端机器码分档**（v2.41 / Issue #16 D1）。
+    // 旧实现用 msg.includes("已满"/"不存在"/"对局中") 判行为 —— 服务端一改文案就静默退化：
+    // 「对局中」会丢掉重试、「不存在」会退化成通用失败。现在行为只看 code（文案只做展示）。
     if (autoJoinRoom !== null && !onlineInTable && state === "online") {
       const roomId = autoJoinRoom;
-      if (msg.includes("已满")) {
-        stopInviteJoin();
-        notifyOnline(`邀请的房间 #${roomId} 已满，已停在大厅：请选别的桌或等一位空位（座位释放后重新点开邀请链接即可）`);
-      } else if (msg.includes("不存在")) {
-        stopInviteJoin();
-        notifyOnline(`邀请链接里的房间 #${roomId} 已不存在，已停在大厅：请向好友要新链接，或自行选桌/开房`);
-      } else if (msg.includes("对局中")) {
-        scheduleInviteJoinRetry();   // 本局进行中 → 等本局结束再试（唯一会重试的情形）
+      const verdict = classifyJoinError(code, msg);
+      if (verdict.retry) {
+        // 唯一会重试的情形：本局进行中 → 等本局结束，重试中每次说明第几次尝试
+        notifyOnline(joinErrorText("playing", roomId));
+        scheduleInviteJoinRetry();
       } else {
-        // v2.38：未知错误不再空转重试（旧版对任何错误都重试 12s），按真实原因报出来
+        // 已满 / 不存在 / 未知错误 → 一次定性，不空转重试（v2.38 起的行为，v2.41 改为按码判定）
         stopInviteJoin();
-        notifyOnline(`邀请房间 #${roomId} 加入失败（${msg}），已停在大厅：请自行选桌/开房`);
+        notifyOnline(joinErrorText(verdict.kind, roomId, msg));
       }
     }
   });

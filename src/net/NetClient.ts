@@ -32,7 +32,8 @@ export interface NetEvents {
   equip_res: (m: EquipResMsg) => void;         // v2.23 成员收到装配/卸载结果
   fortify_req: (m: FortifyReqMsg) => void;     // v2.23 主机收到成员加固请求
   fortify_res: (m: FortifyResMsg) => void;     // v2.23 成员收到加固结果
-  error: (msg: string) => void;
+  /** v2.41：error 事件带服务端机器码（旧服务端为 undefined）+ 展示文案 */
+  error: (msg: string, code?: string) => void;
   closed: () => void;
   left: () => void;
   /** 服务器汇报「当前入口 + 内部 id」（welcome/pong 都会带）→ 客户端自动匹配刷新稳定链接 */
@@ -245,7 +246,8 @@ export class NetClient {
       case "equip_res": this.emit("equip_res", m as unknown as EquipResMsg); break;
       case "fortify_req": this.emit("fortify_req", m as unknown as FortifyReqMsg); break;
       case "fortify_res": this.emit("fortify_res", m as unknown as FortifyResMsg); break;
-      case "error": this.emit("error", String(m.msg)); break;
+      // v2.41（Issue #16 D1）：机器码一并传给上层 —— 重试策略按 code 分档，不再耦合中文文案
+      case "error": this.emit("error", String(m.msg), typeof m.code === "string" ? m.code : undefined); break;
       case "left": this.emit("left"); break;
     }
   }

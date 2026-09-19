@@ -4,16 +4,31 @@
 //   3001 = PR 返工后（本分支）    3002 = main 对照（.probe/mainbuild/dist）
 //   3003 = PR 返工前（ef80055，.probe/prefixbuild/dist）
 // Chromium headless；横屏 968×640 / 竖屏 480×920。点击走 __tankDebug.click（内部换算 CSS 缩放）。
-// puppeteer 由 run-verify.sh 装在 gitignored 的 tests/e2e/ 下并通过 PUPPETEER_MODULE 指过来；
-// 也可直接 `npm i puppeteer` 后按默认解析。
-const puppeteer = (await import(process.env.PUPPETEER_MODULE || "puppeteer")).default;
+// 断言总数以本脚本末尾打印的「汇总：N/N 通过」为准（不要在注释里写死数字，写过一次「39」就腐了）。
+// D2b（Issue #16）：**不再**通过 PUPPETEER_MODULE 传写死的模块路径 ——
+//   run-verify.sh 曾写死 `lib/esm/puppeteer/puppeteer.js`（puppeteer 22 有、25 已删）→ ERR_MODULE_NOT_FOUND。
+//   现在让 Node 自己解析：先按常规 import 解析，失败则用 createRequire 兜底
+//   （NODE_PATH 由 run-verify.sh 指向 gitignored 的 tests/e2e/node_modules）。
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
+async function loadPuppeteer() {
+  try { return (await import("puppeteer")).default; } catch { /* 回落到 createRequire 解析 */ }
+  const require = createRequire(pathToFileURL(process.cwd() + "/"));
+  return (await import(pathToFileURL(require.resolve("puppeteer")).href)).default;
+}
+const puppeteer = await loadPuppeteer();
 import { setTimeout as sleep } from "node:timers/promises";
 
 const results = [];
 const ok = (n, pass, d = "") => { results.push({ n, pass, d }); console.log(`${pass ? "✅" : "❌"} ${n}${d ? " — " + d : ""}`); };
 const note = (s) => console.log(`   · ${s}`);
 
-const browser = await puppeteer.launch({ headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
+const browser = await puppeteer.launch({
+  headless: true,
+  args: ["--no-sandbox", "--disable-dev-shm-usage"],
+  // D2a：run-verify.sh 装完 Chromium 后把**真实二进制**路径传进来（旧版判目录导致半截安装被跳过）
+  ...(process.env.PUPPETEER_EXECUTABLE_PATH ? { executablePath: process.env.PUPPETEER_EXECUTABLE_PATH } : {}),
+});
 
 /** 每个检查用独立 browser context（隔离 localStorage 重连卡 / 剪贴板 / 会话） */
 async function open(port, vw, vh, query, mobile = false) {
@@ -23,7 +38,12 @@ async function open(port, vw, vh, query, mobile = false) {
     ? { width: vw, height: vh, isMobile: true, hasTouch: true, deviceScaleFactor: 2 }
     : { width: vw, height: vh });
   page.on("pageerror", (e) => note(`[pageerror:${port}] ${String(e).slice(0, 120)}`));
-  await page.goto(`http://127.0.0.1:${port}/${query}`, { waitUntil: "networkidle2" });
+  // D2c（Issue #16）：不能等 networkidle2 —— 页面进游戏后会**长期持有 WebSocket**，
+  //   网络永远不会「空闲」（实测并发多页时 12 次打开失败 9 次、单次 30s 超时）。
+  //   改 domcontentloaded + 显式等「画布就绪」（游戏自己挂的 ready 标记），最多 15s。
+  await page.goto(`http://127.0.0.1:${port}/${query}`, { waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => !!(window.__tankDebug && document.getElementById("game-canvas")), { timeout: 15000 })
+    .catch(() => note(`[warn] 画布未就绪（端口 ${port}，query=${query}）`));
   await sleep(1600);
   return { ctx, page };
 }
@@ -428,7 +448,7 @@ try {
     const shapeOf = async (port) => {
       const { ctx, page } = await open(port, 1200, 800, "?room=1&debug=1");
       await page.evaluate(() => { try { localStorage.setItem("tank_public_host", "203.0.113.9:3001"); } catch {} });
-      await page.reload({ waitUntil: "networkidle2" });
+      await page.reload({ waitUntil: "domcontentloaded" });   // D2c：同上，reload 也不能等网络空闲
       await sleep(3000);
       const url = String(j(await dbg(page, `d.inviteUrl()`)));
       await ctx.close();
