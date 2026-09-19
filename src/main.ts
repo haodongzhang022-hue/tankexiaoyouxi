@@ -9,7 +9,7 @@ import { EndlessMode } from "./modes/EndlessMode";
 import { StageMode } from "./modes/StageMode";
 import { DpsTestMode } from "./modes/DpsTestMode";
 import { OnlineHostMode } from "./modes/OnlineHostMode";
-import { parseInviteRoom, buildInviteUrl as buildInviteUrlPure, buildLobbyUrl as buildLobbyUrlPure } from "./net/InviteLink";
+import { parseInviteRoom, buildLobbyUrl as buildLobbyUrlPure, composeInviteUrl } from "./net/InviteLink";
 import { classifyJoinError, joinErrorText, inviteJoinErrorText } from "./net/JoinError";
 import { NetClient } from "./net/NetClient";
 import { RtcPeer, ICE_SERVERS } from "./net/RtcPeer";
@@ -513,10 +513,9 @@ function shareBase(roomId: number | null): { base: string; extra: string; roomIn
 /** 生成「带房间号」邀请链接（好友打开后自动坐到本桌座位上；纯逻辑拼接见 InviteLink.buildInviteUrl）。 */
 function buildInviteUrl(roomId: number): string {
   const { base, extra, roomInPath } = shareBase(roomId);
-  if (!base) return "";
-  // 稳定入口形态：房号已在路径 /<sid>/join/<roomId> 里，不再拼 ?room=（保持 Issue #11 的链接形状）
-  if (roomInPath) return base;
-  return buildInviteUrlPure(base, roomId, extra);
+  // 成形规则见 InviteLink.composeInviteUrl（稳定入口形态下房号在路径里、不再拼 ?room=）；
+  // 抽成纯函数是为了让这条关键行为有 **入库单测** 兜底（Issue #16 🟢，此前只活在 e2e 脚本里）。
+  return composeInviteUrl(base, roomId, extra, roomInPath);
 }
 
 /**

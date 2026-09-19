@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseInviteRoom, buildInviteUrl, buildLobbyUrl, isValidRoomId } from "./InviteLink";
+import { parseInviteRoom, buildInviteUrl, buildLobbyUrl, isValidRoomId, composeInviteUrl } from "./InviteLink";
 
 describe("parseInviteRoom：房间号绑定", () => {
   it("带房间号 → 返回桌号（好友直接坐进该桌）", () => {
@@ -118,5 +118,46 @@ describe("buildLobbyUrl：生成大厅链接（不带房间号）", () => {
 
   it("不再依赖 buildInviteUrl(0)（旧实现会先生成 ?room=0 这条非法链接）", () => {
     expect(buildLobbyUrl("https://h/")).not.toContain("room=0");
+  });
+});
+
+// ── Issue #16 🟢：稳定入口形态的链接形状，必须由**入库单测**兜底 ──
+//  此前这条行为只活在 scripts/e2e/ 的真机脚本里（云端 CI 看不到）。
+//  这里把它锁进 vitest（CI 门禁跑），谁删了 roomInPath 分支就红。
+describe("composeInviteUrl：稳定入口形态 vs 普通形态（Issue #16 🟢 入库兜底）", () => {
+  it("稳定入口形态（roomInPath）→ 房号已在路径里，**不再**拼 ?room=", () => {
+    // 服务器 302 后的形状：/<sid>/join/<roomId>
+    const base = "https://game.example.com/aabbccdd/join/7";
+    expect(composeInviteUrl(base, 7, "", true)).toBe(base);
+    expect(composeInviteUrl(base, 7, "", true)).not.toContain("room=");
+  });
+
+  it("稳定入口形态 + 有额外参数 → 额外参数被忽略（房号已在路径，勿再引入 query 歧义）", () => {
+    const base = "https://game.example.com/aabbccdd/join/7";
+    expect(composeInviteUrl(base, 7, "server=ws%3A%2F%2F1.2.3.4%3A3001", true)).toBe(base);
+  });
+
+  it("普通形态（roomInPath=false）→ 走 buildInviteUrl，拼出 ?room=", () => {
+    expect(composeInviteUrl("https://game.example.com/", 7, "", false))
+      .toBe("https://game.example.com/?room=7");
+    expect(composeInviteUrl("https://game.example.com/", 7))
+      .toBe("https://game.example.com/?room=7");       // 默认就是普通形态
+  });
+
+  it("普通形态保留额外参数（含 server= 时用 & 拼接）", () => {
+    expect(composeInviteUrl("https://game.example.com/", 7, "server=ws%3A%2F%2F1.2.3.4%3A3001", false))
+      .toBe("https://game.example.com/?server=ws%3A%2F%2F1.2.3.4%3A3001&room=7");
+  });
+
+  it("base 为空 → 空串（调用方据此提示「拿不到可分享地址」）", () => {
+    expect(composeInviteUrl("", 7, "", true)).toBe("");
+    expect(composeInviteUrl("", 7, "", false)).toBe("");
+  });
+
+  it("稳定入口形态的链接能被 parseInviteRoom 还原（闭环：房号在路径里靠 302 补 ?room）", () => {
+    // 服务器 302 到 /<sid>/join/<roomId>?room=<roomId> 后，search 里就带上了房号
+    const base = "https://game.example.com/aabbccdd/join/7";
+    expect(composeInviteUrl(base, 7, "", true)).toBe(base);
+    expect(parseInviteRoom("?room=7")).toBe(7);
   });
 });

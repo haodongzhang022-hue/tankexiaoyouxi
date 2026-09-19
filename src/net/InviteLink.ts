@@ -64,3 +64,23 @@ export function buildLobbyUrl(base: string, extraQuery = ""): string {
   if (!q) return base;
   return `${base}${base.includes("?") ? "&" : "?"}${q}`;
 }
+
+/**
+ * 邀请链接的**最终成形**（稳定入口形态 vs 普通形态）—— 纯逻辑，可单测。
+ *
+ * 为什么单独抽出来（Issue #16 🟢 观察项）：这条「稳定入口形态下房号在路径里、不再拼 ?room=」的
+ * 关键行为，原先只活在 `scripts/e2e/` 的真机脚本里（云端 CI 看不到）。抽成纯函数后落进
+ * `src` 下的测试文件，CI 门禁就能兜底 —— 谁把 `roomInPath` 分支删了，单测直接红。
+ *
+ * @param base       入口基址（协议+主机+路径；稳定入口形态下形如 `https://h/<sid>/join/7`）
+ * @param roomId     目标桌号（正整数）
+ * @param extraQuery 额外入口参数（如 `server=ws://...`），稳定入口形态下会被忽略
+ * @param roomInPath 房号是否**已在 base 路径里**（即稳定入口形态 `/<sid>/join/<roomId>`）
+ * @returns 最终邀请链接；base 为空 → 空串（调用方据此提示「拿不到可分享地址」）
+ */
+export function composeInviteUrl(base: string, roomId: number, extraQuery = "", roomInPath = false): string {
+  if (!base) return "";
+  // 稳定入口形态：房号已在路径 /<sid>/join/<roomId> 里，**不再**拼 ?room=（保持 Issue #11 的链接形状）
+  if (roomInPath) return base;
+  return buildInviteUrl(base, roomId, extraQuery);
+}
