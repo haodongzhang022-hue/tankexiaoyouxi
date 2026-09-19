@@ -136,6 +136,48 @@ export function originScope(origin, opts = {}) {
 }
 
 /**
+ * `/entry/localtip`（客户端可达性上报）的**准入判定**（Issue #15 🔴）。
+ *
+ * 病根：这条路由曾经**不需要任何令牌**就能改写「当前入口」并落盘 —— 一条匿名
+ *   `curl '/entry/localtip?origin=http://phish.example.net'` 就把房主分享出去的稳定链接
+ *   302 到攻击者域名（与 PR #7 评审 🔴1 的 Host 伪造同源：入口地址决定 302 目标，
+ *   绝不能被请求方自报的值改写；`?origin=` 只是 Host 的另一个马甲）。
+ *   旧注释声称的前置条件「只在已有登记入口时才接受修正」挡不住：服务器启动即自动登记
+ *   本机 LAN IP（currentSource=register），该条件**默认恒为真**。
+ *
+ * 现在只放行「**本机/同内网自救**」：上报地址必须是**本机网卡自己的 IP**（ownIps），
+ * 且请求的 TCP 对端来自私网/回环。于是：
+ *   · 「任意公网域名 / 任意公网 IP」→ 拒（那正是钓鱼入口的写法）；
+ *   · Issue #11 的「房主同 WiFi 打开、登记的入口在他那侧不通」→ 照旧可用；
+ *   · 公网侧玩家的自救被拒后**照旧能就地开玩**（前端已把当前地址落成本地稳定入口），
+ *     只是不再让「某一个玩家的网络状况」改写所有人的全局入口（刻意的可用性取舍）。
+ *
+ * @param {{tip?:string, peerIp?:string, ownIps?:string[]}} a
+ *        tip = 请求方上报的 origin；peerIp = 请求 TCP 对端 IP；ownIps = 本机网卡 IP 列表
+ * @returns {{ok:boolean, via?:string, reason?:string}}
+ */
+export function localTipAllowedFor({ tip = "", peerIp = "", ownIps = [] } = {}) {
+  const info = originScope(tip, { allowPrivateIp: true });
+  if (!info.ok) return { ok: false, reason: info.reason || "地址不可用作入口" };
+  // ① 必须是「本机自己的 IP」：匿名请求不得把任意公网域名/公网 IP 抬成全局入口
+  const own = (ownIps || []).map((x) => String(x || "").toLowerCase());
+  if (info.kind !== "ip" || !own.includes(info.hostname)) {
+    return {
+      ok: false,
+      reason: "匿名上报只接受本机网卡自己的 IP（任意公网域名/IP 一律拒；部署者请走 /entry/register 或带 X-Tank-Entry-Token）",
+    };
+  }
+  // ② 对端必须来自本机/同内网：外网请求即使猜到本机 IP 也不得改写全局入口
+  // 双栈监听下 IPv4 连接的对端会带 `::ffff:` 前缀，先剥掉（否则私网对端会被误判成 public）
+  const peer = String(peerIp || "").trim().toLowerCase().replace(/^::ffff:/, "").replace(/^\[|\]$/g, "");
+  const scope = ipScope(peer);
+  if (scope !== "private" && scope !== "loopback") {
+    return { ok: false, reason: "请求来源不是本机/同内网，不接受匿名改写全局入口" };
+  }
+  return { ok: true, via: "本机/同内网自救（上报地址 = 本机网卡 IP）" };
+}
+
+/**
  * 从候选列表里取第一个可用 origin（仅规整，不做可信性判断 —— 可信性由调用方负责）。
  * v3.0.2：服务器已改为「按优先级分别校验」的写法（显式登记 > 平台模板 > 保持现状），
  * 这个"挑第一个非空"的旧工具没有调用方了，保留会让读者以为还存在"候选表顺序 = 优先级"的隐式约定。
