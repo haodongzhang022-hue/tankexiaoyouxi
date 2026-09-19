@@ -49,5 +49,5 @@ start_server "$ROOT" 3001
 
 # ── 跑 ──
 cd "$E2E"
-PUPPETEER_MODULE="$E2E/node_modules/puppeteer/lib/esm/puppeteer/puppeteer.js" \
+PUPPETEER_MODULE="$E2E/node_modules/puppeteer/lib/puppeteer/puppeteer.js" \
   node "$ROOT/scripts/e2e/verify-invite-fixes.mjs"

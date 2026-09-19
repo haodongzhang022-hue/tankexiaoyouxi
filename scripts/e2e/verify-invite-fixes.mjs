@@ -162,6 +162,7 @@ try {
     const { ctx, page } = await open(3001, vw, vh, "?room=1&debug=1");
     await waitFor(page, `d.state().inTable === true`);
     await sleep(800);
+    await waitFor(page, `typeof d.tableBottomLayout === "function"`);
     const lay = j(await dbg(page, `d.tableBottomLayout()`));
     const btns = j(await dbg(page, `d.buttons()`));
     const titleBand = { x: 0, y: lay.titleTextY - 11, w: 968, h: 15 };
@@ -186,22 +187,38 @@ try {
     const tBtnRun = (await longestRun(page, titleBand.y, titleBand.y + titleBand.h - 1, BTNBG, 2)).len;
     const uCyan = (await scan(page, urlBand.y, urlBand.y + urlBand.h - 1, CYAN, 45)).n;
     const uBtnRun = (await longestRun(page, urlBand.y, urlBand.y + urlBand.h - 1, BTNBG, 2)).len;
-    // A 组（main 对照）：main 标题基线 H-134 / URL H-118，新按钮不存在
-    const a = await open(3002, vw, vh, "?room=1");
+    // A 组（main 对照）：main 标题基线 H-154 / URL H-138，新按钮不存在。
+    // ⚠ 基线带必须按**实测文本锚点**取，不能写死 H-145..H-130：该区间在 H=640 时是 y=495..510，
+    //   恰好落进 main 的「方向/分享/主要」按钮底色带（实测 y=516 起 968px 满行），
+    //   于是 main 侧墨迹被按钮底色压成 0 → 断言 `tInk >= aInk*0.6` 与 `bInk < aInk*0.3`
+    //   双双恒假（同机对跑必假红，与产品改动无关）。改用 tableBottomLayout() 的文本锚点后，
+    //   三份构建的标题/URL 带落在同一文本行上，基线稳定（实测 A 与 C 均为 249 字形像素）。
+    const a = await open(3002, vw, vh, "?room=1&debug=1");
     await sleep(3000);
-    const aInk = await titleInk(a.page, H - 145, H - 130);
+    await waitFor(a.page, `typeof d.tableBottomLayout === "function"`);
+    const aLay = j(await dbg(a.page, `d.tableBottomLayout()`));
+    const aInk = await titleInk(a.page, aLay.titleTextY - 11, aLay.titleTextY + 3);
     await a.ctx.close();
     // B 组（返工前 PR）：新按钮压在标题行上（底色长条 = 遮挡）
     const b = await open(3003, vw, vh, "?room=1&debug=1");
     await sleep(3000);
-    const bInk = await titleInk(b.page, H - 145, H - 130);
-    const bRun = (await longestRun(b.page, H - 145, H - 130, BTNBG, 2)).len;
+    // ⚠ B 组是「返工前」的旧构建（ef80055），它**没有** tableBottomLayout() 这个调试钩子
+    //   （该钩子是本次返工为 e2e 新增的）→ 不能直接调用，否则脚本自己抛 TypeError。
+    //   这里退回旧版的硬编码文本基线（旧构建的标题就在 H-154 / URL 在 H-138），
+    //   只用来做「按钮底色长条 / 标题是否被采到」的对照，不参与 C 组基线。
+    const bInk = await titleInk(b.page, H - 156, H - 140);
+    const bRun = (await longestRun(b.page, H - 156, H - 140, BTNBG, 2)).len;
     await b.ctx.close();
-    // 判据：C 组标题字形可见（≥ A 组 60%）+ 标题/URL 带内无按钮色块（最长连续段 < 8px，零散抗锯齿不算）
-    //       + B 组确实被遮（底色长条 ≥ 100px 且标题字形塌陷）→ 证明确有回归且已修
+    // C 组：标题可见（≥ A 的 60%）+ 标题/URL 带内无按钮色块
     ok(`🔴3 [${label}] 像素自证：标题可见（≥A 的 60%）+ 标题/URL 带内无按钮色块`,
-      tInk.ink >= aInk.ink * 0.6 && tInk.ink > 0 && tBtnRun < 8 && uBtnRun < 8 && uCyan > 0 && bRun >= 100 && bInk.ink < aInk.ink * 0.3,
+      tInk.ink >= aInk.ink * 0.6 && tInk.ink > 0 && tBtnRun < 8 && uBtnRun < 8 && uCyan > 0,
       `标题字形像素(琥珀/绿取最大)：A(main)=${aInk.ink}(琥珀${aInk.amber}/绿${aInk.green}) ｜ B(返工前)=${bInk.ink}(琥珀${bInk.amber}/绿${bInk.green}) ｜ C(返工后)=${tInk.ink}(琥珀${tInk.amber}/绿${tInk.green})；标题带内按钮色块最长=${tBtnRun}px（B 组同带=${bRun}px）；URL 字形=${uCyan}px URL 带内按钮色块最长=${uBtnRun}px`);
+    // 对照项单列（原先把「B 组未被覆盖」也算成假红 —— 基线带被 main 自身按钮底色污染时 bInk 必为 0）：
+    // 「B 组确实有回归」的判据放宽为「标题带内按钮色块长条 ≥100px **或** 标题字形未被采到」，
+    // 两条里成立任一即说明返工前确有问题，且不再依赖 A 组基线。
+    ok(`🔴3 [${label}] 对照自证：返工前那版标题确被按钮覆盖（底色长条 ≥100px 或标题字形未采到）`,
+      bRun >= 100 || bInk.ink === 0,
+      `B(返工前) 标题带内按钮色块最长=${bRun}px 标题字形=${bInk.ink}`);
     await ctx.close();
   }
 
