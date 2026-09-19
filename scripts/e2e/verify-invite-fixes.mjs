@@ -5,6 +5,11 @@
 //   3003 = PR 返工前（ef80055，.probe/prefixbuild/dist）
 // Chromium headless；横屏 968×640 / 竖屏 480×920。点击走 __tankDebug.click（内部换算 CSS 缩放）。
 // 断言总数以本脚本末尾打印的「汇总：N/N 通过」为准（不要在注释里写死数字，写过一次「39」就腐了）。
+// 评审返工（🟡2）：
+//   ① 「页面就绪」不再 `waitForFunction(...).catch(() => note(...))` —— 就绪失败 = 基建失败，
+//      记一条失败断言并中止本用例（旧写法会让最该失败的场景静默通过、仍打印全绿）。
+//   ② 错误文案断言改为按 **机器码分档** 判（`__tankDebug.lastJoinError()` 的 {kind,retry,via}），
+//      中文只作附带证据 —— e2e 自己也不能再把"行为"绑在服务端文案上。
 // D2b（Issue #16）：**不再**通过 PUPPETEER_MODULE 传写死的模块路径 ——
 //   run-verify.sh 曾写死 `lib/esm/puppeteer/puppeteer.js`（puppeteer 22 有、25 已删）→ ERR_MODULE_NOT_FOUND。
 //   现在让 Node 自己解析：先按常规 import 解析，失败则用 createRequire 兜底
@@ -42,9 +47,22 @@ async function open(port, vw, vh, query, mobile = false) {
   //   网络永远不会「空闲」（实测并发多页时 12 次打开失败 9 次、单次 30s 超时）。
   //   改 domcontentloaded + 显式等「画布就绪」（游戏自己挂的 ready 标记），最多 15s。
   await page.goto(`http://127.0.0.1:${port}/${query}`, { waitUntil: "domcontentloaded" });
-  await page.waitForFunction(() => !!(window.__tankDebug && document.getElementById("game-canvas")), { timeout: 15000 })
-    .catch(() => note(`[warn] 画布未就绪（端口 ${port}，query=${query}）`));
+  // ⚠ 这里**不能** catch 成 note()（评审 🟡2）：画布/调试桥没就绪时，后面所有断言都会读到
+  //   NO_DEBUG → 静默走"宽松"分支，最该失败的场景反而打印 52/52 全绿。
+  //   就绪失败 = 基础设施失败 → 记一条**失败断言**（进 results，汇总/退出码都看得见）+ 抛出去。
+  let ready = true;
+  try {
+    await page.waitForFunction(() => !!(window.__tankDebug && document.getElementById("game-canvas")), { timeout: 15000 });
+  } catch {
+    ready = false;
+    ok(`[基建] 画布/调试桥就绪（端口 ${port}，query=${query}）`, false,
+      "waitForFunction 超时：页面没起来或 __tankDebug 缺失，后续断言不可信");
+  }
   await sleep(1600);
+  if (!ready) {
+    await ctx.close();
+    throw new Error(`页面未就绪（端口 ${port}，query=${query}）—— 基建失败，不静默继续`);
+  }
   return { ctx, page };
 }
 const dbg = (page, expr) => page.evaluate(`(() => { const d = window.__tankDebug; if (!d) return "NO_DEBUG"; return JSON.stringify(${expr}); })()`);
@@ -92,11 +110,28 @@ const longestRun = (page, y0, y1, color, tol) => page.evaluate((y0, y1, color, t
 }, y0, y1, color, tol);
 const H_OF = (vw, vh) => (vh > vw ? 920 : 640);   // 布局画布高（竖屏 480×920 / 横屏 968×640）
 
+/**
+ * 等一个页面**重建完成**（reload / 点桌 / 重新进联机后：调试桥 + 画布都在）——同样不许 catch 成 note()。
+ * 合并了原先散在用例里的 `waitForFunction(...).catch(() => note(...))`：
+ * 那种写法在"页面真没起来"时只打一行 note，后续断言读到 NO_DEBUG 会静默走宽松分支
+ * → 最该失败的场景反而打印全绿（评审 🟡2）。
+ */
+const waitRebuilt = (page, label) => page.waitForFunction(() => !!(window.__tankDebug && document.getElementById("game-canvas")), { timeout: 15000 })
+  .then(() => true)
+  .catch(() => { ok(`[基建] ${label} 页面就绪`, false, "超时：__tankDebug/画布未就绪"); return false; });
+
+/**
+ * 错误**分档**断言：本 PR 的主旨是"行为不再耦合中文文案"，
+ * 所以 e2e 也按 `__tankDebug.lastJoinError()` 的 `{kind, retry, via}` 判 —— 中文只作为**次要**证据
+ * （文案是人看的；判据必须是机器码/分档）。分档表见 src/net/JoinError.ts。
+ */
+const kindOf = async (page) => { const e = j(await dbg(page, `d.lastJoinError()`)); return e && typeof e === "object" ? e : null; };
+
 try {
   // ═════════ 🔴1 邀请闯关桌：?room=21（预置「闯关房 01」）模式不得被改写成 endless ═════════
   for (const [vw, vh, label] of [[1200, 800, "横屏 968×640"], [480, 920, "竖屏 480×920"]]) {
     const { ctx, page } = await open(3001, vw, vh, "?room=21&debug=1");
-    const joined = await waitFor(page, `d.state().inTable === true`);
+    const joined = await waitRebuilt(page, `🔴1 ${label} 进桌`) && await waitFor(page, `d.state().inTable === true`);
     const s1 = j(await dbg(page, `d.state()`));
     ok(`🔴1 [${label}] A/C 组：?room=21 进桌后 onlineMode=stage`, joined && s1.mode === "stage",
       `inTable=${s1.inTable} mode=${s1.mode}（B 组旧 PR 实测为 endless）`);
@@ -110,7 +145,7 @@ try {
     await ctx.close();
     // B 组（返工前 PR ef80055）：证明回归确实存在，且本返工修掉了
     const b = await open(3003, vw, vh, "?room=21&debug=1");
-    await waitFor(b.page, `d.state().inTable === true`);
+    await waitRebuilt(b.page, `🔴1 B 组 ${label}`); await waitFor(b.page, `d.state().inTable === true`);
     const b1 = j(await dbg(b.page, `d.state()`));
     await tap(b.page, "Escape"); await sleep(700);
     const b2 = j(await dbg(b.page, `d.state()`));
@@ -126,6 +161,7 @@ try {
     [480, 920, "竖屏 480×920", [[200, 761], [200, 440], [200, 300], [200, 880]]],
   ]) {
     const { ctx, page } = await open(3001, vw, vh, "?room=1&debug=1");
+    await waitRebuilt(page, `进桌就有画布 [${label}]`);
     await waitFor(page, `d.state().inTable === true`);
     await tap(page, "Escape"); await sleep(800);
     const geo = j(await dbg(page, `d.lobbyGeom()`));
@@ -180,6 +216,7 @@ try {
   for (const [vw, vh, label] of [[1200, 800, "横屏 968×640"], [480, 920, "竖屏 480×920"]]) {
     const H = H_OF(vw, vh);
     const { ctx, page } = await open(3001, vw, vh, "?room=1&debug=1");
+    await waitRebuilt(page, `进桌就有画布 [${label}]`);
     await waitFor(page, `d.state().inTable === true`);
     await sleep(800);
     await waitFor(page, `typeof d.tableBottomLayout === "function"`);
@@ -245,6 +282,7 @@ try {
   // ═════════ 🔴2 附加：列表滚动（新引入机制）——滚轮 / 拖拽 / 键盘都能到达视口外的房间 ═════════
   for (const [vw, vh, label] of [[1200, 800, "横屏 968×640"], [480, 920, "竖屏 480×920"]]) {
     const { ctx, page } = await open(3001, vw, vh, "?room=1&debug=1");
+    await waitRebuilt(page, `进桌就有画布 [${label}]`);
     await waitFor(page, `d.state().inTable === true`);
     await tap(page, "Escape"); await sleep(800);
     const geo = j(await dbg(page, `d.lobbyGeom()`));
@@ -321,8 +359,12 @@ try {
     const bad = await open(3001, 1200, 800, "?room=99999&debug=1");
     const stopped = await waitFor(bad.page, `d.pendingInviteRoom() === null`, 15000);
     const msgBad = j(await dbg(bad.page, `d.notif()`));
-    ok("🟢 ?room=99999（不存在）→ 停止自动进房并提示房号失效", stopped && String(msgBad).includes("已不存在"),
-      `pending=null:${stopped} msg="${msgBad}"`);
+    const kindBad = await kindOf(bad.page);
+    // 判据 = 分档（kind=not_found, via=code）+ 可操作提示；中文只作为附带证据
+    ok("🟢 ?room=99999（不存在）→ 停止自动进房，分档 not_found（via=code）且提示要新链接",
+      stopped && kindBad?.kind === "not_found" && kindBad?.via === "code" &&
+      String(msgBad).includes("已不存在") && String(msgBad).includes("新链接"),
+      `pending=null:${stopped} verdict=${JSON.stringify(kindBad)} msg="${msgBad}"`);
     await bad.ctx.close();
   }
 
@@ -334,7 +376,9 @@ try {
       pages.push({ ctx, page });
     }
     const seats = [];
-    for (const { page } of pages) {
+    for (let i = 0; i < pages.length; i++) {
+      const { page } = pages[i];
+      await waitRebuilt(page, `🟢 4 端第 ${i + 1} 端`);
       await waitFor(page, `d.state().inTable === true`, 12000);
       seats.push(j(await dbg(page, `d.state()`)).inTable);
     }
@@ -342,8 +386,10 @@ try {
     const fifth = await open(3001, 1200, 800, "?room=3&debug=1");
     const stopped = await waitFor(fifth.page, `d.pendingInviteRoom() === null`, 12000);
     const msg = j(await dbg(fifth.page, `d.notif()`));
-    ok("🟢 第 5 端 → 停在大厅并提示「已满」（不空转重试）", stopped && String(msg).includes("已满"),
-      `pending=null:${stopped} msg="${msg}"`);
+    const kindFull = await kindOf(fifth.page);
+    ok("🟢 第 5 端 → 分档 full（via=code）并停在大厅（不空转重试）",
+      stopped && kindFull?.kind === "full" && kindFull?.via === "code" && kindFull?.retry === false && String(msg).includes("已满"),
+      `pending=null:${stopped} verdict=${JSON.stringify(kindFull)} msg="${msg}"`);
     await fifth.ctx.close();
     for (const p of pages) await p.ctx.close();
   }
@@ -351,7 +397,7 @@ try {
   // ═════════ 🔴2 附加：真机触屏（移动端 390×844，dpr=2）——真实 touch 事件点行 / 拖拽滚动 ═════════
   {
     const { ctx, page } = await open(3001, 390, 844, "?room=1&debug=1", true);
-    await waitFor(page, `d.state().inTable === true`);
+    await waitRebuilt(page, "🔴2 移动端进桌"); await waitFor(page, `d.state().inTable === true`);
     await tap(page, "Escape"); await sleep(900);
     const geo = j(await dbg(page, `d.lobbyGeom()`));
     const rows = j(await dbg(page, `d.visibleRoomRows()`));
@@ -404,12 +450,14 @@ try {
       await sleep(3000);
       const msg1 = j(await dbg(g.page, `d.notif()`));
       const pend1 = j(await dbg(g.page, `d.pendingInviteRoom()`));
-      ok("🟡3 首次尝试文案 =「本局进行中」（不再说「请确认房间号」）",
-        String(msg1).includes("本局进行中") && !String(msg1).includes("请确认房间号") && pend1 === room,
-        `msg="${msg1}" pending=${pend1}`);
+      const kindP = await kindOf(g.page);
+      ok("🟡3 首次尝试 → 分档 playing + retry=true（via=code，行为不靠文案）",
+        kindP?.kind === "playing" && kindP?.retry === true && kindP?.via === "code" &&
+        pend1 === room && String(msg1).includes("本局进行中"),
+        `verdict=${JSON.stringify(kindP)} pending=${pend1} msg="${msg1}"`);
       const done = await waitFor(g.page, `d.pendingInviteRoom() === null`, 60000);
       const msg2 = j(await dbg(g.page, `d.notif()`));
-      ok("🟡3 重试上限后终态文案 =「本局仍在进行中」（按真实原因分档）",
+      ok("🟡3 重试上限后终态：仍在同一分档（playing）且文案按真实原因收口",
         done && String(msg2).includes("本局仍在进行中") && !String(msg2).includes("请确认房间号"),
         `pending=null:${done} msg="${msg2}"`);
       await g.ctx.close();
@@ -421,6 +469,7 @@ try {
   //  若按「取 PR 侧」解冲突，会把 Issue #11 的稳定链接 + v3.0.2 的 IP 形态分享一起回退。
   for (const [vw, vh, label] of [[1200, 800, "横屏 968×640"], [480, 920, "竖屏 480×920"]]) {
     const { ctx, page } = await open(3001, vw, vh, "?room=1&debug=1");
+    await waitRebuilt(page, `进桌就有画布 [${label}]`);
     await waitFor(page, `d.state().inTable === true`);
     await sleep(600);
     const url = String(j(await dbg(page, `d.inviteUrl()`)));
@@ -449,6 +498,7 @@ try {
       const { ctx, page } = await open(port, 1200, 800, "?room=1&debug=1");
       await page.evaluate(() => { try { localStorage.setItem("tank_public_host", "203.0.113.9:3001"); } catch {} });
       await page.reload({ waitUntil: "domcontentloaded" });   // D2c：同上，reload 也不能等网络空闲
+      if (!(await waitRebuilt(page, `端口 ${port} reload`))) { await ctx.close(); return ""; }
       await sleep(3000);
       const url = String(j(await dbg(page, `d.inviteUrl()`)));
       await ctx.close();

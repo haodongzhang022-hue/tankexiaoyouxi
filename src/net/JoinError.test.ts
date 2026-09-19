@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { classifyJoinError, joinErrorText } from "./JoinError";
+import { classifyJoinError, joinErrorText, inviteJoinErrorText } from "./JoinError";
 
 // Issue #16 D1：加入房间失败的**分档判定**必须与中文文案解耦。
 // 判据 = 服务端 error 帧的机器码（shared/net-error-codes.mjs）；
@@ -21,13 +21,26 @@ describe("classifyJoinError：按服务端机器码分档（主路径）", () =>
     expect(v).toEqual({ kind: "playing", retry: true, via: "code" });
   });
 
-  it("其它机器码（已分类但不是加入房间的）→ 明确不重试，不瞎猜", () => {
-    for (const c of ["already_in_table", "host_only", "start_precondition", "no_rejoin"]) {
+  it("其它机器码（不是加入房间错误 / 未知新码）→ 明确不重试，不瞎猜", () => {
+    for (const c of ["already_in_table", "host_only", "start_precondition", "no_rejoin", "brand_new_code"]) {
       const v = classifyJoinError(c, "随便什么文案");
       expect(v.kind).toBe("unknown");
       expect(v.retry).toBe(false);
       expect(v.via).toBe("code");
     }
+  });
+
+  // ★ 评审返工（v2.41）核心：room_not_found / room_full 是 join 处理器直接发出的**加入错误**，
+  //   绝不能被「不是加入错误」的黑名单剔掉（剔掉就判不出 not_found / full，文案退化成通用失败）。
+  it("🔴 回归：room_not_found / room_full 必须判得出（不得被「不是加入错误」清单剔出映射）", () => {
+    expect(classifyJoinError("room_not_found", "房间不存在")).toEqual({ kind: "not_found", retry: false, via: "code" });
+    expect(classifyJoinError("room_full", "房间已满")).toEqual({ kind: "full", retry: false, via: "code" });
+    // 服务端发这两个码时，即便文案被本地化/清空，分档也不变
+    expect(classifyJoinError("room_not_found", "").kind).toBe("not_found");
+    expect(classifyJoinError("room_full", "").kind).toBe("full");
+    // 老实现的退化路径（拿别的流程的结论套过来）会落到这里：文案丢掉「要新链接」
+    const degraded = joinErrorText(classifyJoinError("room_not_found", "房间不存在").kind, 99999);
+    expect(degraded).toContain("新链接");
   });
 
   // ★ 本 Issue 的**核心回归锁**：服务端把文案换成机器码/英文/加前缀后，行为不得退化
@@ -80,7 +93,7 @@ describe("joinErrorText：文案只做展示，且必须说清「什么原因 + 
     const t = joinErrorText("full", 3);
     expect(t).toContain("#3");
     expect(t).toContain("已满");
-    expect(t).toContain("已停在大厅");
+    expect(t).toContain("等一位空位");
   });
 
   it("不存在 → 提示要新链接（旧实现会退化成通用「加入失败」）", () => {
@@ -97,5 +110,26 @@ describe("joinErrorText：文案只做展示，且必须说清「什么原因 + 
     const t = joinErrorText("unknown", 7, "连不上服务器");
     expect(t).toContain("连不上服务器");
     expect(t).toContain("#7");
+  });
+
+  it("kind 入参宽松：需要序列化的判定结果可直接透传（不必二次手写 \"playing\"）", () => {
+    const serialized: { kind: string } = JSON.parse(JSON.stringify({ kind: classifyJoinError("room_playing", "x").kind }));
+    expect(joinErrorText(serialized.kind, 5)).toContain("本局进行中");
+  });
+
+  it("房号未知（无房号）时不出现 undefined/null 噪声", () => {
+    for (const t of [joinErrorText("unknown", null, "服务端说不行"), joinErrorText("unknown", undefined, "服务端说不行")]) {
+      expect(t).not.toContain("undefined");
+      expect(t).not.toContain("null");
+      expect(t).toContain("服务端说不行");
+    }
+  });
+
+  it("inviteJoinErrorText：邀请流程的前后缀（已停在大厅）由调用方上下文决定", () => {
+    const t = inviteJoinErrorText(classifyJoinError("room_not_found", "房间不存在").kind, 42);
+    expect(t).toContain("#42");
+    expect(t).toContain("已不存在");
+    expect(t).toContain("已停在大厅");
+    expect(t).toContain("新链接");
   });
 });

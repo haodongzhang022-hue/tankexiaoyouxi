@@ -10,7 +10,7 @@ import { StageMode } from "./modes/StageMode";
 import { DpsTestMode } from "./modes/DpsTestMode";
 import { OnlineHostMode } from "./modes/OnlineHostMode";
 import { parseInviteRoom, buildInviteUrl as buildInviteUrlPure, buildLobbyUrl as buildLobbyUrlPure } from "./net/InviteLink";
-import { classifyJoinError, joinErrorText } from "./net/JoinError";
+import { classifyJoinError, joinErrorText, inviteJoinErrorText } from "./net/JoinError";
 import { NetClient } from "./net/NetClient";
 import { RtcPeer, ICE_SERVERS } from "./net/RtcPeer";
 import type { ServerCandidate } from "./net/NetClient";
@@ -909,6 +909,14 @@ function returnToOnlineLobby(): void {
   notifyOnline("已返回大厅，重新选桌或新建房间");
 }
 
+/**
+ * 最近一次「加入房间失败」的判定结果（v2.41 / Issue #16 D1）。
+ * 只记判定（kind/retry/via），不参与行为 —— 供 e2e 断言"行为由机器码决定，不靠中文文案"。
+ */
+let lastJoinErrorVerdict:
+  | { kind: string; retry: boolean; via: "code" | "msg"; msg: string; roomId: number | null; at: number }
+  | null = null;
+
 /** 邀请链接自动进房的重试状态：只对「本局进行中」重试（等本局结束）；其余错误一次定性。 */
 let inviteJoinTries = 0;
 const INVITE_JOIN_MAX_TRIES = 10;          // 10 次 × 3s = 30s：够等一局短局打完
@@ -1120,21 +1128,31 @@ function wireNetHandlers(): void {
     if (peekRejoinCard()) { clearRejoinCard(); notifyOnline(`重连失败：${msg}，已回大厅`); }
     // v2.25 大厅内连接失败（服务器未启动/重启中）→ 自动重试，不把玩家丢回主菜单
     if (state === "online" && !net.connected) { scheduleOnlineReconnect(); return; }
-    // 邀请链接自动进房：**按服务端机器码分档**（v2.41 / Issue #16 D1）。
+    // 加入房间失败：**按服务端机器码分档**（v2.41 / Issue #16 D1）。
     // 旧实现用 msg.includes("已满"/"不存在"/"对局中") 判行为 —— 服务端一改文案就静默退化：
     // 「对局中」会丢掉重试、「不存在」会退化成通用失败。现在行为只看 code（文案只做展示）。
+    // ⚠ 判据（classifyJoinError）是**与流程无关**的：它只回答"这条错误说明房间怎么了"。
+    //   "当前处在哪个流程"由下面的分支决定 —— 别再拿某一流程的结论去套另一个流程
+    //   （返工前把邀请分支的取舍套到重连场景，重连卡失败时会丢掉「要新链接」这类可操作提示）。
+    const verdict = classifyJoinError(code, msg);
+    lastJoinErrorVerdict = { kind: verdict.kind, retry: verdict.retry, via: verdict.via, msg: String(msg), roomId: autoJoinRoom ?? onlineCurrent?.id ?? null, at: Date.now() };
     if (autoJoinRoom !== null && !onlineInTable && state === "online") {
+      // ── 流程 A：邀请链接自动进房 ──
       const roomId = autoJoinRoom;
-      const verdict = classifyJoinError(code, msg);
       if (verdict.retry) {
         // 唯一会重试的情形：本局进行中 → 等本局结束，重试中每次说明第几次尝试
-        notifyOnline(joinErrorText("playing", roomId));
+        notifyOnline(joinErrorText(verdict.kind, roomId));
         scheduleInviteJoinRetry();
       } else {
         // 已满 / 不存在 / 未知错误 → 一次定性，不空转重试（v2.38 起的行为，v2.41 改为按码判定）
         stopInviteJoin();
-        notifyOnline(joinErrorText(verdict.kind, roomId, msg));
+        notifyOnline(inviteJoinErrorText(verdict.kind, roomId, msg));
       }
+    } else if (!onlineInTable && state === "online") {
+      // ── 流程 B：留在大厅时的其它错误（重连卡已在上方消费掉；这里只兜"玩家点桌 / 服务器拒绝"）──
+      // 文案同样由 verdict.kind 驱动（不手写 "playing"），reason 取不到时退回服务端原文。
+      if (verdict.retry) notifyOnline(joinErrorText(verdict.kind, onlineCurrent?.id ?? null));
+      else notifyOnline(joinErrorText(verdict.kind, onlineCurrent?.id ?? null, msg));
     }
   });
   net.on("peerInput", (msg) => { if (host && msg.idx === 1) { host.enqueueRemoteInput(msg.flags, msg.clientFrame ?? 0, msg.clientSendTime ?? Date.now()); host.lastPeerInputTime = msg.clientSendTime ?? Date.now(); } });
@@ -2378,6 +2396,8 @@ if (new URLSearchParams(location.search).has("debug")) {
     /** e2e：把选中行设到指定下标（配合 scrollLobby 做确定性键盘滚动断言） */
     selectRoomRow: (n: number) => { onlineSel = Math.max(0, n); lastLobbySel = onlineSel; },
     notif: () => onlineMsg,
+    /** e2e：最近一次加入失败的判定（kind/retry/via）—— 断言"行为不靠中文文案"用 */
+    lastJoinError: () => lastJoinErrorVerdict,
     serverLanIps: () => serverLanIps,
     state: () => ({ state, mode: onlineMode, inTable: onlineInTable, netConnected: net.connected }),
     key: (code: string) => {
