@@ -43,7 +43,10 @@ export interface StartMsg {
 export interface RejoinOkMsg { t: "rejoin_ok"; mode: "endless" | "stage"; myIndex: number; players: Array<{ clientId: number; name: string }>; seed: number; rejoinToken: string; orient?: "landscape" | "portrait"; }
 export interface SnapshotMsg { t: "snapshot"; data: NetSnapshot; }
 export interface GameOverMsg { t: "gameover"; info: { reason: string; score: number }; }
-export interface ErrorMsg { t: "error"; msg: string; }
+/** v2.41（Issue #16 D1）error 帧：`code` 是机器码（见 shared/net-error-codes.mjs），
+ *  客户端**按 code 决定行为**（能不能重试），`msg` 只用于展示。
+ *  `code` 为可选：旧服务端没有它，客户端回落到关键词兜底（见 src/net/JoinError.ts）。 */
+export interface ErrorMsg { t: "error"; code?: string; msg: string; }
 export interface LeftMsg { t: "left"; }
 /** 服务器 RTT 探测回包：ts 为客户端发起时的原时间戳（ping / input 携带 clientSendTime 均触发），RTT = Date.now() - ts */
 export interface PongMsg { t: "pong"; ts: number; }

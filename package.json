@@ -16,7 +16,10 @@
     "net:tunnel": "node scripts/net-tunnel.mjs",
     "net:latency": "node scripts/net-latency.mjs",
     "deploy:server": "bash deploy/start-server.sh",
-    "net:entry-test": "node --test src/net/entry-match.test.mjs"
+    "net:entry-test": "node --test src/net/entry-match.test.mjs",
+    "typecheck": "tsc --noEmit",
+    "verify": "npx tsc --noEmit && npm run build && npx vitest run && npm run net:entry-test",
+    "test:local": "sh scripts/e2e/run-verify.sh"
   },
   "dependencies": {
     "ws": "^8.21.0"
