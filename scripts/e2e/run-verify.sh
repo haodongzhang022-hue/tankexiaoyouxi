@@ -41,12 +41,30 @@ fi
 # ── D2a：浏览器安装状态必须判**真实二进制**，不能判目录 ──
 #   puppeteer 25 的实际落点：$PUPPETEER_CACHE_DIR/chrome/linux-<ver>/chrome-linux64/chrome
 #   旧版判 `[ -x "$PUPPETEER_CACHE_DIR/chrome" ]`（目录）恒真 → 半截安装被跳过 → "Could not find Chrome"。
+#   ⚠ 两处保险（评审 🟡3）：
+#     ① find 走管道 + set -e：find 自身报错（目录已没）时 `head` 先退出会让管道非零退出 → 脚本
+#        直接中止。这里 `|| true` 把"找不到"变成正常的空结果，由下面的分支去装。
+#     ② 装之前**先装到临时目录再原子换入**：离线/下载失败时原来一行 `rm -rf` 会把玩家本来可用的
+#        Chromium 缓存删掉（下次连离线能用的环境都跑不起来了）。现在只有装成功了才替换。
 chrome_bin() {
-  find "$PUPPETEER_CACHE_DIR" -type f -name chrome -path "*chrome-linux64*" 2>/dev/null | head -n 1
+  { find "$PUPPETEER_CACHE_DIR" -type f -name chrome -path "*chrome-linux64*" 2>/dev/null || true; } | head -n 1
+}
+install_chrome() { # 装到临时缓存目录 → 成功才替换（失败保留原缓存，离线不"自毁"）
+  tmp="$E2E/.chrome-new"
+  rm -rf "$tmp"
+  if PUPPETEER_CACHE_DIR="$tmp" sh -c 'cd "'"$E2E"'" && npx puppeteer browsers install chrome' >/dev/null 2>&1 \
+     && [ -n "$({ find "$tmp" -type f -name chrome -path "*chrome-linux64*" 2>/dev/null || true; } | head -n 1)" ]; then
+    rm -rf "$PUPPETEER_CACHE_DIR"
+    mv "$tmp" "$PUPPETEER_CACHE_DIR"
+    return 0
+  fi
+  rm -rf "$tmp"
+  return 1
 }
 if [ -z "$(chrome_bin)" ]; then
-  rm -rf "$PUPPETEER_CACHE_DIR"          # 清掉半截安装，避免又踩 D2a
-  (cd "$E2E" && npx puppeteer browsers install chrome >/dev/null 2>&1) || true
+  # 半截安装（目录在、真二进制不在）也要重装 —— 但先装到临时目录，装不成不动原缓存
+  echo "[e2e] 未发现可用 Chromium 二进制，尝试安装（失败不会删掉已有缓存）…"
+  install_chrome || true
 fi
 CHROME_BIN=$(chrome_bin)
 if [ -n "$CHROME_BIN" ]; then
