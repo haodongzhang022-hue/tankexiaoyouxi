@@ -28,7 +28,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createEntryMatcher, entryPath, makeSid, normalizeOrigin, SID_RE, originScope, ipScope, hasTemplatePlaceholder, localTipAllowedFor } from "../../shared/entry-match.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -785,20 +785,77 @@ test("🔴 回归（Issue #16 D1）：加入房间的 error 帧必须带机器�
   for (const c of [a, ...members, fifth, late]) c.close();
 });
 
+/**
+ * 把 `src/net/JoinError.ts` 里导出的常量**真读出来**（不是 grep 源码）。
+ * 为什么必须真读（评审 🔴2）：旧用例只 import 了 shared 那份、再断言字面量，
+ * 前端 JoinError.ts 的常量根本没被读过 —— 把 `ERR_ROOM_FULL` 改成 "room_full_TYPO"，
+ * vitest 会红（那边有真 import），但 `npm run net:entry-test` 照样 28/28 全绿。
+ * 做法：用 esbuild（vite 自带依赖）把 TS 打成临时 .mjs，再动态 import —— 不必引入 ts 运行时。
+ * 顺带这条用例也就锁住了「前端不得手抄码表」：真读过值，漂移必红。
+ */
+async function importFrontendConstants() {
+  const { build } = await import("esbuild");
+  const src = path.resolve(__dirname, "JoinError.ts");
+  const out = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "tank-je-")), "JoinError.mjs");
+  await build({ entryPoints: [src], outfile: out, bundle: true, format: "esm", platform: "node", logLevel: "silent" });
+  return import(pathToFileURL(out).href);
+}
+
 test("🔴 回归（Issue #16 D1）：机器码常量与前端判定表同值（前后端同一套契约）", async () => {
-  const m = await import("../../shared/net-error-codes.mjs");
-  // 与 src/net/JoinError.ts 里导出的常量保持一致（前端是 TS、服务端是 mjs，两边都从这里对齐）
-  assert.equal(m.ERR_ROOM_NOT_FOUND, "room_not_found");
-  assert.equal(m.ERR_ROOM_FULL, "room_full");
-  assert.equal(m.ERR_ROOM_PLAYING, "room_playing");
-  // 唯一可重试的码 = room_playing（与前端 classifyJoinError 的 retry 口径一致）
-  assert.deepEqual([...m.RETRYABLE_JOIN_CODES], ["room_playing"]);
-  assert.equal(m.isRetryableJoinCode("room_playing"), true);
-  assert.equal(m.isRetryableJoinCode("room_full"), false);
-  assert.equal(m.isRetryableJoinCode(undefined), false);
-  // 前端源码里必须是按 code 分档、且**不再**把关键词当主路径
-  const fs = await import("node:fs");
+  const shared = await import("../../shared/net-error-codes.mjs");
+  const fe = await importFrontendConstants();
+
+  // ① 前端导出的常量必须**逐一等于** shared 契约的值（评审 🔴2：此前只断言 shared 的字面量）
+  for (const k of ["ERR_ROOM_NOT_FOUND", "ERR_ROOM_FULL", "ERR_ROOM_PLAYING", "ERR_ALREADY_IN_TABLE", "ERR_HOST_ONLY", "ERR_START_PRECONDITION", "ERR_NO_REJOIN", "ERR_UNKNOWN"]) {
+    assert.ok(k in fe, `JoinError.ts 应导出 ${k}`);
+    assert.ok(k in shared, `shared/net-error-codes.mjs 应导出 ${k}`);
+    assert.equal(fe[k], shared[k], `${k} 前后端必须同值：前端=${fe[k]} 服务端=${shared[k]}`);
+  }
+  // ② 值本身是协议契约，不许被就地"顺手改掉"（改动必须同时改 shared 与服务端）
+  assert.equal(shared.ERR_ROOM_NOT_FOUND, "room_not_found");
+  assert.equal(shared.ERR_ROOM_FULL, "room_full");
+  assert.equal(shared.ERR_ROOM_PLAYING, "room_playing");
+  // ③ 唯一可重试的码 = room_playing，且**前端判定真按它走**（不是文案猜的）
+  assert.deepEqual([...shared.RETRYABLE_JOIN_CODES], ["room_playing"]);
+  assert.equal(shared.isRetryableJoinCode("room_playing"), true);
+  assert.equal(shared.isRetryableJoinCode("room_full"), false);
+  assert.equal(shared.isRetryableJoinCode(undefined), false);
+  assert.equal(fe.classifyJoinError(shared.ERR_ROOM_PLAYING, "文案随便写").retry, true);
+  assert.equal(fe.classifyJoinError(shared.ERR_ROOM_FULL, "文案随便写").retry, false);
+  assert.equal(fe.classifyJoinError(shared.ERR_ROOM_FULL, "文案随便写").kind, "full");
+  // ④ 前端源码里必须是按 code 分档、且**不再**把关键词当主路径；且**不得手抄码字面量**（必须真读契约）
   const src = fs.readFileSync(new URL("./JoinError.ts", import.meta.url), "utf8");
   assert.match(src, /kindOfCode/, "JoinError.ts 应有按 code 分档的实现");
   assert.match(src, /via: "msg"/, "JoinError.ts 应保留（且仅保留）旧服务端关键词兜底");
+  assert.match(src, /from "\.\.\/\.\.\/shared\/net-error-codes\.mjs"/, "JoinError.ts 必须直接读 shared 契约（禁止手抄常量）");
 });
+
+test("🔴 回归（Issue #16 D1/🔴1）：错误帧决策入口按流程分档，且重连的「已回大厅」不被覆盖", async () => {
+  const fe = await importFrontendConstants();
+  // ① 「不是加入错误」的码：不得被说成"加入房间失败"（评审 🔴1 的文案倒挂）。含 attemptJoin=true 的极端入参
+  for (const c of ["host_only", "start_precondition", "already_in_table"]) {
+    for (const attemptJoin of [false, true, undefined]) {
+      const d = fe.decideErrorFrame(c, "仅房主可开始", { attemptJoin, roomId: 7, rawMsg: "仅房主可开始" });
+      assert.equal(d.frameKind, "not_add", `${c} 的口径必须是 not_add`);
+      assert.equal(d.isJoinFailure, false, `${c} 不是加入错误`);
+      assert.equal(d.text, "仅房主可开始", `${c} 应原样展示服务端原文`);
+      assert.doesNotMatch(d.text, /加入房间/, `${c} 不得被渲染成"加入房间失败"`);
+    }
+  }
+  // ② 大厅里点桌遇到「本局进行中」：文案不得暗示会自动等本局结束（重试只对邀请流程生效，评审 🟡4）
+  const lobbyPlaying = fe.decideErrorFrame("room_playing", "该房间对局中", { attemptJoin: false, roomId: 7, rawMsg: "该房间对局中" });
+  assert.ok(lobbyPlaying.retry === true, "playing 判据本身仍标记为「值得重试」（调用方决定要不要真重试）");
+  // ③ 重连卡场景：必须渲染出"已回到大厅"，且不是邀请/加入房间口径（评审 🔴1）
+  for (const [code, raw] of [["no_rejoin", "重连令牌无效或已失效"], ["room_full", "房间已满"], ["room_not_found", "房间不存在"]]) {
+    const r = fe.decideErrorFrame(code, raw, { rejoining: true, roomId: 12, rawMsg: raw });
+    assert.match(r.text, /已回到大厅/, `${code} 的重连文案必须说清已回到大厅（此前被「加入房间失败」盖掉）`);
+    assert.doesNotMatch(r.text, /加入房间/, `${code} 重连场景不得说成加入房间失败`);
+    assert.doesNotMatch(r.text, /邀请/, `${code} 重连场景不得出现"邀请"口径`);
+  }
+  // ④ 邀请流程：三个典型加入错误必须分档到具体 kind（不许退化成 unknown 泛化文案）
+  assert.equal(fe.decideErrorFrame("room_full", "x", { attemptJoin: true, roomId: 3, rawMsg: "x" }).kind, "full");
+  assert.equal(fe.decideErrorFrame("room_not_found", "x", { attemptJoin: true, roomId: 3, rawMsg: "x" }).kind, "not_found");
+  assert.equal(fe.decideErrorFrame("room_playing", "x", { attemptJoin: true, roomId: 3, rawMsg: "x" }).kind, "playing");
+  assert.match(fe.decideErrorFrame("room_not_found", "x", { attemptJoin: true, roomId: 3, rawMsg: "x" }).text, /新链接/);
+});
+

@@ -9,8 +9,8 @@ import { EndlessMode } from "./modes/EndlessMode";
 import { StageMode } from "./modes/StageMode";
 import { DpsTestMode } from "./modes/DpsTestMode";
 import { OnlineHostMode } from "./modes/OnlineHostMode";
-import { parseInviteRoom, buildLobbyUrl as buildLobbyUrlPure, composeInviteUrl, inviteUrlMode } from "./net/InviteLink";
-import { classifyJoinError, joinErrorText, inviteJoinErrorText } from "./net/JoinError";
+import { parseInviteRoom, buildLobbyUrl as buildLobbyUrlPure, composeInviteUrlSafe, inviteUrlMode } from "./net/InviteLink";
+import { decideErrorFrame } from "./net/JoinError";
 import { NetClient } from "./net/NetClient";
 import { RtcPeer, ICE_SERVERS } from "./net/RtcPeer";
 import type { ServerCandidate } from "./net/NetClient";
@@ -510,19 +510,28 @@ function shareBase(roomId: number | null): { base: string; extra: string; roomIn
   return { base: "", ...noRoom }; // 拿不到任何可分享地址（无局域网网卡），由调用方提示
 }
 
-/** 生成「带房间号」邀请链接（好友打开后自动坐到本桌座位上；纯逻辑拼接见 InviteLink.buildInviteUrl）。 */
+/**
+ * 生成「带房间号」邀请链接（好友打开后自动坐到本桌座位上）。
+ * 成形规则见 InviteLink.composeInviteUrlSafe（稳定入口形态下房号在路径里、不再拼 ?room=）；
+ * 抽成纯函数是为了让这条关键行为有 **入库单测** 兜底（Issue #16 🟢，此前只活在 e2e 脚本里）。
+ * ⚠ 本函数跑在渲染热路径（renderOnline 每帧 + __tankDebug.inviteUrl）→ **绝不抛错**（评审 🟡3）：
+ *   形态校验失败只退化为空串/安全兜底，问题在出口处提示一次，不刷屏、不打断大厅渲染。
+ */
 function buildInviteUrl(roomId: number): string {
   const { base, extra, roomInPath } = shareBase(roomId);
-  // 成形规则见 InviteLink.composeInviteUrl（稳定入口形态下房号在路径里、不再拼 ?room=）；
-  // 抽成纯函数是为了让这条关键行为有 **入库单测** 兜底（Issue #16 🟢，此前只活在 e2e 脚本里）。
-  // 形态由 inviteUrlMode 从 base 推断并校验（评审打回：不再手传布尔，漏传会当场抛错而非静默畸形）。
   const mode = inviteUrlMode(base);
   if (roomInPath !== (mode === "stable-entry")) {
-    // shareBase 的标记与 base 实际形状不符 —— 立即报错，别把畸形链接发给玩家
-    throw new Error(`shareBase 形态不一致：roomInPath=${roomInPath} 但 base=${JSON.stringify(base)}`);
+    // shareBase 的标记与 base 实际形状不符：返回空串（调用方提示「拿不到可分享地址」），不发给玩家畸形链接
+    lastInviteUrlProblem = `shareBase 形态不一致：roomInPath=${roomInPath} 但 base=${JSON.stringify(base)}`;
+    return "";
   }
-  return composeInviteUrl(base, roomId, extra, mode);
+  const { url, problem } = composeInviteUrlSafe(base, roomId, extra, mode);
+  lastInviteUrlProblem = problem ?? null;
+  return url;
 }
+
+/** 最近一次邀请链接成形问题（渲染热路径上不 throws，问题憋到这里，出口处提示一次） */
+let lastInviteUrlProblem: string | null = null;
 
 /**
  * 不带房间号的「大厅链接」：好友打开后进大厅，自己选桌/开房（不占座位）。
@@ -790,7 +799,10 @@ function onlineCopyInvite(): void {
   if (!onlineCurrent) return;
   const url = buildInviteUrl(onlineCurrent.id);
   if (!url || url.includes("//localhost") || url.includes("//127.0.0.1")) {
-    notifyOnline("无法生成分享链接：未获取到本机局域网地址，请改用 http://<你的IP>:3001 打开页面");
+    // 出口处提示一次（渲染热路径上不抛错，问题在这里显式暴露，见 buildInviteUrl 注释）
+    notifyOnline(lastInviteUrlProblem
+      ? `无法生成分享链接：${lastInviteUrlProblem}`
+      : "无法生成分享链接：未获取到本机局域网地址，请改用 http://<你的IP>:3001 打开页面");
     return;
   }
   copyText(url);
@@ -1102,7 +1114,9 @@ function wireNetHandlers(): void {
     // 进入房间时重置人机队友数量和座位状态
     if (onlineInTable) { roomBotCount = 0; seatStates = ["open", "open", "open", "open"]; }
   });
-  net.on("error", (m) => notifyOnline(m));
+  // ⚠ 这里曾有一条 `net.on("error", (m) => notifyOnline(m))` —— 死代码：NetClient.on() 是**覆盖**语义
+  //   （handlers[k] = cb），它被下方 1132 行的统一 error handler 覆盖，恒不生效，且会误导人
+  //   以为"兜底文案"来自这里（评审 🟡2 已删）。error 帧只有下方**一个**入口。
   net.on("closed", () => {
     if (state === "online" || state === "online_host" || state === "online_client") {
       // v2.25 断线不再踢回主菜单（避免玩家误点"开始"被导流到离线单机）：
@@ -1129,35 +1143,39 @@ function wireNetHandlers(): void {
     beginOnlineGame({ myIndex: d.myIndex, mode: d.mode, players: d.players, orient: d.orient });
     notifyOnline("对局重连成功，继续游戏");
   });
-  net.on("error", (msg, code) => {  // v2.11 重连令牌失效（对局已结束/座位被顶替/房主迁移）→ 清卡回大厅
-    if (peekRejoinCard()) { clearRejoinCard(); notifyOnline(`重连失败：${msg}，已回大厅`); }
-    // v2.25 大厅内连接失败（服务器未启动/重启中）→ 自动重试，不把玩家丢回主菜单
+  net.on("error", (msg, code) => {  // 服务端 error 帧的统一入口（v2.11 起；v2.42 收编决策）
+    // ① 重连卡场景：令牌失效/对局已结束/座位被顶替 → 清卡 + 按**重连口径**渲染，然后 return。
+    //    返工前这里只说 `重连失败：${msg}，已回大厅`，紧接着又被下方流程 B 的"加入房间失败（…）"
+    //    整条盖掉 —— 玩家看不到"已回大厅"（评审 🔴1）。现在渲染完就 return，不会被覆盖。
+    const rej = peekRejoinCard();
+    if (rej) {
+      clearRejoinCard();
+      notifyOnline(decideErrorFrame(code, msg, { rejoining: true, roomId: rej.tableId, rawMsg: String(msg) }).text);
+      return;
+    }
+    // ② 大厅内连接失败（服务器未启动/重启中）→ 自动重试，不把玩家丢回主菜单
     if (state === "online" && !net.connected) { scheduleOnlineReconnect(); return; }
-    // 加入房间失败：**按服务端机器码分档**（v2.41 / Issue #16 D1）。
-    // 旧实现用 msg.includes("已满"/"不存在"/"对局中") 判行为 —— 服务端一改文案就静默退化：
-    // 「对局中」会丢掉重试、「不存在」会退化成通用失败。现在行为只看 code（文案只做展示）。
-    // ⚠ 判据（classifyJoinError）是**与流程无关**的：它只回答"这条错误说明房间怎么了"。
-    //   "当前处在哪个流程"由下面的分支决定 —— 别再拿某一流程的结论去套另一个流程
-    //   （返工前把邀请分支的取舍套到重连场景，重连卡失败时会丢掉「要新链接」这类可操作提示）。
-    const verdict = classifyJoinError(code, msg);
-    lastJoinErrorVerdict = { kind: verdict.kind, retry: verdict.retry, via: verdict.via, msg: String(msg), roomId: autoJoinRoom ?? onlineCurrent?.id ?? null, at: Date.now() };
-    if (autoJoinRoom !== null && !onlineInTable && state === "online") {
-      // ── 流程 A：邀请链接自动进房 ──
-      const roomId = autoJoinRoom;
-      if (verdict.retry) {
-        // 唯一会重试的情形：本局进行中 → 等本局结束，重试中每次说明第几次尝试
-        notifyOnline(joinErrorText(verdict.kind, roomId));
-        scheduleInviteJoinRetry();
-      } else {
-        // 已满 / 不存在 / 未知错误 → 一次定性，不空转重试（v2.38 起的行为，v2.41 改为按码判定）
-        stopInviteJoin();
-        notifyOnline(inviteJoinErrorText(verdict.kind, roomId, msg));
-      }
-    } else if (!onlineInTable && state === "online") {
-      // ── 流程 B：留在大厅时的其它错误（重连卡已在上方消费掉；这里只兜"玩家点桌 / 服务器拒绝"）──
-      // 文案同样由 verdict.kind 驱动（不手写 "playing"），reason 取不到时退回服务端原文。
-      if (verdict.retry) notifyOnline(joinErrorText(verdict.kind, onlineCurrent?.id ?? null));
-      else notifyOnline(joinErrorText(verdict.kind, onlineCurrent?.id ?? null, msg));
+    // ③ 其它错误帧：**先记判定**（e2e 断言"行为由机器码决定，不靠中文文案"），再按流程处置。
+    const isInviteJoin = autoJoinRoom !== null && !onlineInTable && state === "online";
+    const isLobbyError = !onlineInTable && state === "online";
+    if (!isInviteJoin && !isLobbyError) return;
+    // 流程由入参表达，文案口径由 decideErrorFrame 单点决定 —— 不再把「邀请进房」的结论套到大厅场景
+    // （返工前 host_only / start_precondition / no_rejoin 会被说成"加入房间失败"，与语义矛盾）。
+    const d = isInviteJoin
+      ? decideErrorFrame(code, msg, { attemptJoin: true, roomId: autoJoinRoom, rawMsg: String(msg) })
+      : decideErrorFrame(code, msg, { attemptJoin: false, roomId: onlineCurrent?.id ?? null, rawMsg: String(msg) });
+    lastJoinErrorVerdict = { kind: d.kind, retry: d.retry, via: d.via, msg: String(msg), roomId: isInviteJoin ? autoJoinRoom : (onlineCurrent?.id ?? null), at: Date.now() };
+    if (d.retry) {
+      // 唯一会重试的情形：邀请的房间本局进行中 → 等本局结束（重试中每次说明第几次尝试）
+      notifyOnline(d.text);
+      scheduleInviteJoinRetry();
+    } else {
+      if (isInviteJoin) stopInviteJoin();     // 已满 / 不存在 / 未知 → 一次定性，不空转重试
+      // 🟡4：大厅里点桌遇到「本局进行中」不重试（重试只对邀请流程生效）→ 文案不能暗示"正在等本局结束"，
+      // 否则玩家以为系统会自动带他进去。这里改成"稍后自己再点一次"的明确指引。
+      notifyOnline(!isInviteJoin && d.kind === "playing"
+        ? "该房间对局中：请等本局结束后再点一次进桌"
+        : d.text);
     }
   });
   net.on("peerInput", (msg) => { if (host && msg.idx === 1) { host.enqueueRemoteInput(msg.flags, msg.clientFrame ?? 0, msg.clientSendTime ?? Date.now()); host.lastPeerInputTime = msg.clientSendTime ?? Date.now(); } });

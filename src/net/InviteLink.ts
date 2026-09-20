@@ -11,6 +11,11 @@
 //    · 房间号非法 = 视为「不带房间号」→ 进大厅。
 //  与 main.ts 解耦，便于单测锁死行为（曾经踩过：?room= 被静默忽略 / 链接不带房号）。
 
+// 稳定入口路径模式：**从 shared 单点派生**（SID_LEN），不在本文件手写 8 位 hex（评审 🟢）。
+// @ts-expect-error —— shared/ 是给 server(mjs) 共用的 .mjs，无 .d.ts；这里按契约取字符串模板。
+import { STABLE_ENTRY_PATH_SOURCE as _STABLE_ENTRY_PATH_SOURCE } from "../../shared/entry-match.mjs";
+const STABLE_ENTRY_PATH_SOURCE = _STABLE_ENTRY_PATH_SOURCE as string;
+
 /** 服务端桌号的合法范围：正整数（十进制、有限、整数、> 0）。 */
 export function isValidRoomId(n: unknown): boolean {
   return typeof n === "number" && Number.isFinite(n) && n > 0 && Number.isInteger(n);
@@ -68,8 +73,12 @@ export function buildLobbyUrl(base: string, extraQuery = ""): string {
 /** 邀请链接形态：`stable-entry` = 房号在路径 `/<sid>/join/<roomId>`；`plain` = 房号走 query `?room=`。 */
 export type InviteUrlMode = "stable-entry" | "plain";
 
-/** 稳定入口形态的路径：`/<sid>/join/<roomId>`（sid 为 8 位小写 hex，房号可选）。 */
-const STABLE_ENTRY_PATH_RE = /\/[0-9a-f]{8}\/join\/(\d*)(?:[?#]|$)/;
+/**
+ * 稳定入口形态的路径：`/<sid>/join/<roomId>`（房号可选）。
+ * 模式**派生自 shared/entry-match.mjs**（`SID_LEN` 单点）—— 此前 `[0-9a-f]{8}` 在本文件、
+ * shared/entry-match.mjs、net-sync-core/core.ts 各写一遍，改一处就静默漂移（评审 🟢）。
+ */
+const STABLE_ENTRY_PATH_RE = new RegExp(STABLE_ENTRY_PATH_SOURCE);
 
 /**
  * base 路径里是否**已显式带房号**（`/<sid>/join/<roomId>`）。
@@ -103,18 +112,40 @@ export function inviteUrlMode(base: string): InviteUrlMode {
  *                   稳定 base 漏传第 4 参会静默产出 `/<sid>/join/7?room=7` 这种双房号畸形链接）。
  *                   调用方请用 `inviteUrlMode(base)` 推断，别凭记忆写布尔。
  * @returns 最终邀请链接；base 为空 → 空串（调用方据此提示「拿不到可分享地址」）
- * @throws  形态与 base 不符时抛错（稳定形态的 base 路径里没房号、普通形态的 base 已带房号），
- *           把「脚枪式静默畸形」变成「当场失败」，由单测覆盖。
+ *
+ * ⚠ 形态与 base 不符时**不再抛错**（评审 🟡3）：本函数跑在 `renderOnline()` 的渲染热路径上
+ *   （每帧调用，还有 `__tankDebug.inviteUrl`），一抛就是每帧刷屏 + 打断大厅渲染。
+ *   改为**安全兜底 + 返回形态问题**（`InviteUrlResult.problem`），由调用方在出口处提示一次。
+ *   "不许静默产出畸形链接"这条原则不变：兜底结果绝不会是 `/<sid>/join/7?room=7` 这种双房号。
  */
-export function composeInviteUrl(base: string, roomId: number, extraQuery: string, mode: InviteUrlMode): string {
-  if (!base) return "";
+export interface InviteUrlResult {
+  /** 可分享链接；无法成形时为空串 */
+  url: string;
+  /** 形态校验失败原因（undefined = 正常）；仅"普通形态的 base 已带房号"这类会兜底出链接 */
+  problem?: string;
+}
+
+/** composeInviteUrl 的"带问题回报"版本（热路径用）：绝不抛错，问题通过返回值暴露 */
+export function composeInviteUrlSafe(base: string, roomId: number, extraQuery: string, mode: InviteUrlMode): InviteUrlResult {
+  if (!base) return { url: "" };
   if (mode === "stable-entry") {
     // 稳定入口形态：房号必须已在路径 /<sid>/join/<roomId> 里，**不再**拼 ?room=（保持 Issue #11 的链接形状）
-    if (!hasExplicitRoomInPath(base)) throw new Error("composeInviteUrl: 稳定入口形态要求房号在 base 路径里（/<sid>/join/<roomId>）");
-    return base;
+    if (hasExplicitRoomInPath(base)) return { url: base };
+    return { url: "", problem: "稳定入口形态要求房号在 base 路径里（/<sid>/join/<roomId>）" };
   }
   if (hasExplicitRoomInPath(base)) {
-    throw new Error("composeInviteUrl: 普通形态的 base 不应已带房号路径（该走稳定入口形态）");
+    // 普通形态却已经带了房号路径：保留 base 原样（房号已在路径里，语义正确），绝不追加 ?room=
+    return { url: base, problem: "普通形态的 base 已带房号路径，已按稳定入口形态原样使用" };
   }
-  return buildInviteUrl(base, roomId, extraQuery);
+  return { url: buildInviteUrl(base, roomId, extraQuery) };
+}
+
+/**
+ * 严格版（**非热路径**用，如单测 / 工具脚本）：形态不符直接抛错。
+ * 热路径请用 composeInviteUrlSafe —— 见上方说明（评审 🟡3）。
+ */
+export function composeInviteUrl(base: string, roomId: number, extraQuery: string, mode: InviteUrlMode): string {
+  const r = composeInviteUrlSafe(base, roomId, extraQuery, mode);
+  if (r.problem) throw new Error(`composeInviteUrl: ${r.problem}`);
+  return r.url;
 }

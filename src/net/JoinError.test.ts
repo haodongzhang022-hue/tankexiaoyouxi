@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { classifyJoinError, joinErrorText, inviteJoinErrorText } from "./JoinError";
+import { classifyJoinError, decideErrorFrame, frameKindOfCode, joinErrorText, inviteJoinErrorText, rejoinErrorText, ERR_HOST_ONLY, ERR_START_PRECONDITION, ERR_NO_REJOIN, ERR_ALREADY_IN_TABLE, ERR_ROOM_FULL, ERR_ROOM_NOT_FOUND, ERR_ROOM_PLAYING } from "./JoinError";
+// @ts-expect-error —— shared/ 是给 server(mjs) 共用的 .mjs（无 .d.ts）：本用例就是要读它的**真值**
+import * as sharedCodesRaw from "../../shared/net-error-codes.mjs";
+const sharedCodes = sharedCodesRaw as Record<string, unknown>;
 
 // Issue #16 D1：加入房间失败的**分档判定**必须与中文文案解耦。
 // 判据 = 服务端 error 帧的机器码（shared/net-error-codes.mjs）；
@@ -131,5 +134,120 @@ describe("joinErrorText：文案只做展示，且必须说清「什么原因 + 
     expect(t).toContain("已不存在");
     expect(t).toContain("已停在大厅");
     expect(t).toContain("新链接");
+  });
+});
+
+// ── 评审 🔴1：错误帧的**单一决策入口**（流程差异只体现在入参，不靠调用方手写分支）──
+describe("decideErrorFrame：文案口径 + 是否重试单点决定", () => {
+  it("🔴 回归：大厅里的「不是加入错误」码 → 原样服务端原文，绝不说成「加入房间失败」", () => {
+    for (const c of [ERR_HOST_ONLY, ERR_START_PRECONDITION, ERR_NO_REJOIN]) {
+      const d = decideErrorFrame(c, "仅房主可开始", { attemptJoin: false, roomId: 7, rawMsg: "仅房主可开始" });
+      expect(d.kind).toBe("unknown");       // 不是加入错误的码 → 认不出，不瞎猜
+      expect(d.isJoinFailure).toBe(false);  // ★ 关键：不得被渲染成"加入房间失败"
+      expect(d.text).toBe("仅房主可开始");    // 原样带出，玩家看到的是真实原因
+      expect(d.text).not.toContain("加入房间");
+      expect(d.retry).toBe(false);
+    }
+  });
+
+  it("🔴 回归：真·加房间请求（attemptJoin=true）→ 按码分档，unknown 也带原文", () => {
+    const full = decideErrorFrame(ERR_ROOM_FULL, "房间已满", { attemptJoin: true, roomId: 3, rawMsg: "房间已满" });
+    expect(full.kind).toBe("full");
+    expect(full.isJoinFailure).toBe(true);
+    expect(full.text).toContain("已满");
+    expect(full.stopFlow).toBe(true);         // 邀请流程：一次定性，停止空转重试
+
+    const nf = decideErrorFrame(ERR_ROOM_NOT_FOUND, "房间不存在", { attemptJoin: true, roomId: 99, rawMsg: "房间不存在" });
+    expect(nf.text).toContain("新链接");
+
+    const playing = decideErrorFrame(ERR_ROOM_PLAYING, "该房间对局中", { attemptJoin: true, roomId: 5, rawMsg: "该房间对局中" });
+    expect(playing.retry).toBe(true);         // 唯一会重试：等本局结束
+    expect(playing.stopFlow).toBe(false);
+
+    const unknown = decideErrorFrame("brand_new_code", "服务端新错误", { attemptJoin: true, roomId: 5, rawMsg: "服务端新错误" });
+    expect(unknown.isJoinFailure).toBe(true);
+    expect(unknown.text).toContain("服务端新错误");   // 不吞原因
+    expect(unknown.retry).toBe(false);
+  });
+
+  it("🔴 回归：重连场景用「重连对局」口径，且**不再**说成加入房间失败", () => {
+    const d = decideErrorFrame(ERR_NO_REJOIN, "重连令牌无效或已失效", { rejoining: true, roomId: 12, rawMsg: "重连令牌无效或已失效" });
+    expect(d.isJoinFailure).toBe(false);
+    expect(d.text).toContain("重连令牌无效或已失效");  // 不是加入错误 → 原文（不臆造"加入房间失败"）
+    expect(d.text).toContain("已回到大厅");           // 但**必须**说清已回大厅
+    expect(d.text).not.toContain("加入房间");
+    // 重连桌上恰好"满了/没了"这两个**加入错误**码：按重连口径渲染，并说明已回大厅
+    for (const [code, raw, word] of [[ERR_ROOM_FULL, "房间已满", "已被占满"], [ERR_ROOM_NOT_FOUND, "房间不存在", "已不存在"]] as const) {
+      const r = decideErrorFrame(code, raw, { rejoining: true, roomId: 12, rawMsg: raw });
+      expect(r.isJoinFailure).toBe(true);
+      expect(r.text).toContain("重连对局");
+      expect(r.text).toContain("已回到大厅");          // ★ 关键：玩家必须看到"已回大厅"
+      expect(r.text).toContain(word);
+      expect(r.text).not.toContain("邀请");
+    }
+  });
+
+  it("重试只在「加房间 + 本局进行中」时成立（非加入错误不得空转重试）", () => {
+    expect(decideErrorFrame(ERR_ROOM_PLAYING, "对局中", { attemptJoin: false, rawMsg: "对局中" }).retry).toBe(true);
+    expect(decideErrorFrame(ERR_ROOM_PLAYING, "对局中", { attemptJoin: false, rawMsg: "对局中" }).stopFlow).toBe(false);
+    expect(decideErrorFrame(ERR_HOST_ONLY, "仅房主", { attemptJoin: false, rawMsg: "仅房主" }).retry).toBe(false);
+  });
+
+  it("重连文案出口与 rejoinErrorText 一致（同一句话只有一处定义）", () => {
+    const d = decideErrorFrame(ERR_ROOM_FULL, "房间已满", { rejoining: true, roomId: 12, rawMsg: "房间已满" });
+    expect(d.text).toBe(rejoinErrorText("full", 12));
+  });
+});
+
+// ── 评审 🔴2：前后端常量**同值**必须由代码保证（此前前端手抄一份，漂移时 CI 无感）──
+describe("🔴 前后端机器码同源（禁止手抄）", () => {
+  it("前端导出的常量 === shared/net-error-codes.mjs 的值（逐一比对）", () => {
+    const c = sharedCodes;
+    expect(ERR_ROOM_NOT_FOUND).toBe(c.ERR_ROOM_NOT_FOUND);
+    expect(ERR_ROOM_FULL).toBe(c.ERR_ROOM_FULL);
+    expect(ERR_ROOM_PLAYING).toBe(c.ERR_ROOM_PLAYING);
+    expect(ERR_HOST_ONLY).toBe(c.ERR_HOST_ONLY);
+    expect(ERR_START_PRECONDITION).toBe(c.ERR_START_PRECONDITION);
+    expect(ERR_NO_REJOIN).toBe(c.ERR_NO_REJOIN);
+  });
+
+  it("JoinError.ts 里不得再出现字面量机器码（手抄即漂移源）", async () => {
+    const fs = await import("node:fs");
+    const src = fs.readFileSync(new URL("./JoinError.ts", import.meta.url), "utf8");
+    // 只查"赋值/比较"用法；注释与文档里提到码名是允许的
+    for (const lit of ['= "room_full"', '= "room_not_found"', '= "room_playing"', '= "host_only"', '= "start_precondition"', '= "no_rejoin"', '=== "room_full"', '=== "room_playing"']) {
+      expect(src, `JoinError.ts 不应手抄机器码字面量：${lit}`).not.toContain(lit);
+    }
+    expect(src).toContain('from "../../shared/net-error-codes.mjs"');   // 必须真读契约
+  });
+});
+
+// ── 评审 🟡1：NOT_ADD_ERRORS 必须真被消费（不许"定义后零引用"的死代码）──
+describe("frameKindOfCode：展示口径由码单点决定（真查 NOT_ADD_ERRORS）", () => {
+  it("明确不是加入错误的码 → not_add（永远原样原文，不被「这次在加房间」带偏）", () => {
+    for (const c of [ERR_HOST_ONLY, ERR_START_PRECONDITION, ERR_ALREADY_IN_TABLE]) {
+      expect(frameKindOfCode(c, false)).toBe("not_add");
+      expect(frameKindOfCode(c, true)).toBe("not_add");   // ★ 即便调用方说"在加房间"也不改口径
+    }
+  });
+
+  it("典型加入错误码 → join（无需调用方声明）", () => {
+    for (const c of [ERR_ROOM_FULL, ERR_ROOM_NOT_FOUND, ERR_ROOM_PLAYING]) {
+      expect(frameKindOfCode(c, false)).toBe("join");
+      expect(frameKindOfCode(c, true)).toBe("join");
+    }
+  });
+
+  it("服务端新增码 / 无码 → other，除非调用方确认「这次真在加房间」", () => {
+    expect(frameKindOfCode("brand_new_code", false)).toBe("other");
+    expect(frameKindOfCode("brand_new_code", true)).toBe("join");
+    expect(frameKindOfCode(undefined, true)).toBe("other");   // 旧服务端：无码可判，交文案兜底
+    expect(frameKindOfCode("", true)).toBe("other");
+  });
+
+  it("与 decideErrorFrame 的口径一致（同一判定只有一处实现）", () => {
+    expect(decideErrorFrame(ERR_HOST_ONLY, "仅房主", { attemptJoin: true, rawMsg: "仅房主" }).frameKind).toBe("not_add");
+    expect(decideErrorFrame(ERR_ROOM_FULL, "已满", { attemptJoin: true, rawMsg: "已满" }).frameKind).toBe("join");
+    expect(decideErrorFrame("x", "原文", { attemptJoin: true, rawMsg: "原文" }).frameKind).toBe("join");
   });
 });
