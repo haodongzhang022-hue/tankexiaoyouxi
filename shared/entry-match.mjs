@@ -22,6 +22,13 @@ import crypto from "node:crypto";
 /** 稳定入口的路径形状：/<sid>/join/<roomId>（sid = 服务器内部 id） */
 export const SID_LEN = 8;
 export const SID_RE = new RegExp(`^[0-9a-f]{${SID_LEN}}$`);
+
+/**
+ * 稳定入口路径的**匹配模式**（单点派生自 SID_LEN，别再各处手写 `[0-9a-f]{8}`）：
+ *   `/<sid>/join/<roomId?>`；捕获组 1 = 房号（'' 表示路径里只到 `/join/`）。
+ * 前端 InviteLink.ts 的形态校验从这里派生，避免「8 位 hex」在三处各写一遍后偷偷漂移。
+ */
+export const STABLE_ENTRY_PATH_SOURCE = `/[0-9a-f]{${SID_LEN}}/join/(\\d*)(?:[?#]|$)`;
 export const ENTRY_TTL_MS = 5 * 60 * 1000;          // 绑定「超过这么久没被刷新碰过」即视为陈旧
 export const ENTRY_SWEEP_MS = 15 * 1000;            // 后台清理周期
 export const ENTRY_KEEPALIVE_MS = 60 * 1000;        // 云原生环境最长回收窗口内保活一次

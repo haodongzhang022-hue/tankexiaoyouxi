@@ -32,8 +32,12 @@ export interface NetEvents {
   equip_res: (m: EquipResMsg) => void;         // v2.23 成员收到装配/卸载结果
   fortify_req: (m: FortifyReqMsg) => void;     // v2.23 主机收到成员加固请求
   fortify_res: (m: FortifyResMsg) => void;     // v2.23 成员收到加固结果
-  /** v2.41：error 事件带服务端机器码（旧服务端为 undefined）+ 展示文案 */
-  error: (msg: string, code?: string) => void;
+  /**
+   * v2.41：error 事件带服务端机器码（旧服务端为 undefined）+ 展示文案；
+   * v3.0.4：带**发起者 clientId** —— 服务器把「房间内某人被拒」的 error 帧也广播给全桌，
+   * 客户端必须只处理 `from === 自己` 的帧（否则会把队友的「仅房主可开始」当成自己的加入失败）。
+   */
+  error: (msg: string, code?: string, from?: number) => void;
   closed: () => void;
   left: () => void;
   /** 服务器汇报「当前入口 + 内部 id」（welcome/pong 都会带）→ 客户端自动匹配刷新稳定链接 */
@@ -247,7 +251,9 @@ export class NetClient {
       case "fortify_req": this.emit("fortify_req", m as unknown as FortifyReqMsg); break;
       case "fortify_res": this.emit("fortify_res", m as unknown as FortifyResMsg); break;
       // v2.41（Issue #16 D1）：机器码一并传给上层 —— 重试策略按 code 分档，不再耦合中文文案
-      case "error": this.emit("error", String(m.msg), typeof m.code === "string" ? m.code : undefined); break;
+      // v3.0.4：error 帧带 from（发起者 clientId；老服务端无此字段 → undefined，按"无法归因"处理）
+      case "error": this.emit("error", String(m.msg), typeof m.code === "string" ? m.code : undefined,
+        Number.isInteger(m.from) ? Number(m.from) : undefined); break;
       case "left": this.emit("left"); break;
     }
   }
@@ -271,6 +277,12 @@ export class NetClient {
   ready(value: boolean): void { this.send({ t: "ready", value }); }
   /** v2.36 房主：更改房间方向（横屏/竖屏）——大厅广播后成员端同步，开局按最新方向创建地图 */
   setOrient(orient: "landscape" | "portrait"): void { this.send({ t: "orient", orient }); }
+  /**
+   * v3.0.4 房主：设置某个座位的状态（开放 / AI / 关闭）。
+   * ⚠ 必须上报服务器而不是改本地变量：座位状态参与开局"哪些席位交给 AI"的实际语义，
+   *   只改本地 → 服务器仍按 4 座全空算，座位被真人占掉后房主侧状态与真实座位错位。
+   */
+  setSeat(idx: number, state: "open" | "ai" | "closed"): void { this.send({ t: "setseat", idx, state }); }
   start(): void { this.send({ t: "start" }); }
 
   // ── 游戏期 ──

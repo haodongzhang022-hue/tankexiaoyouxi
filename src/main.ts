@@ -9,8 +9,8 @@ import { EndlessMode } from "./modes/EndlessMode";
 import { StageMode } from "./modes/StageMode";
 import { DpsTestMode } from "./modes/DpsTestMode";
 import { OnlineHostMode } from "./modes/OnlineHostMode";
-import { parseInviteRoom, buildLobbyUrl as buildLobbyUrlPure, composeInviteUrl, inviteUrlMode } from "./net/InviteLink";
-import { classifyJoinError, joinErrorText, inviteJoinErrorText } from "./net/JoinError";
+import { parseInviteRoom, buildLobbyUrl as buildLobbyUrlPure, composeInviteUrlSafe, inviteUrlMode } from "./net/InviteLink";
+import { decideErrorFrame } from "./net/JoinError";
 import { NetClient } from "./net/NetClient";
 import { RtcPeer, ICE_SERVERS } from "./net/RtcPeer";
 import type { ServerCandidate } from "./net/NetClient";
@@ -214,6 +214,46 @@ function keepStableEntryForOrigin(origin: string | null): void {
 function saveRejoinCard(tableId: number, token: string): void { rejoinMgr.save({ tableId, token }); }
 function peekRejoinCard(): { tableId: number; token: string } | null { return rejoinMgr.peek(); }
 function clearRejoinCard(): void { rejoinMgr.clear(); }
+
+// ── v3.0.4 重连请求的**归因**状态（错误帧的两条流程靠它分开）─────────────────────────
+// 为什么需要：服务端的错误码是**流程无关**的 —— 同一个 room_playing 既可能是"我加不进这张桌"，
+// 也可能是"我接不回那一局"。只靠 code 分不出来，于是 v2.42 把"值得重试"的结论按邀请流程套给了
+// 所有房间内错误 → 玩家在局内断线，回来后服务器说"该对局进行中，接不回去"（room_playing），
+// 而邀请重试机制以为"等本局结束就能进"，3 秒一次无限重试，永远不可能成功。
+// 现在：由**发起动作**归因 —— 谁发的 rejoin 请求，谁负责消费随后的 error 帧。
+let rejoinRequested = false;                 // 我方已发出 rejoin，等它的结论（rejoin_ok / error）
+let rejoinRetryTimer: number | null = null;  // 重连自身的有界重试（与邀请进房的重试互不共用）
+const REJOIN_RETRY_MS = 3000;
+const REJOIN_MAX_TRIES = 4;
+let rejoinTry = 0;
+function stopRejoinRetry(): void {
+  rejoinRequested = false;
+  rejoinTry = 0;
+  if (rejoinRetryTimer !== null) { clearTimeout(rejoinRetryTimer); rejoinRetryTimer = null; }
+}
+/** 发起一次重连（唯一出口：打标 rejoinRequested，供错误帧归因） */
+function requestRejoin(tableId: number, token: string): void {
+  rejoinRequested = true;
+  net.rejoin(tableId, token);
+}
+/**
+ * 重连被服务器拒（对局已结束 / 令牌失效 / 座位被顶替）→ 有界重试后放弃。
+ * 为什么值得重试：最常见的拒因是"那一局还没彻底收尾"（room_playing 的瞬时态），
+ * 隔几秒再试一次往往就通了；但**必须封顶**，否则就是本次修的 bug（3s 一次无限空转）。
+ */
+function scheduleRejoinRetry(): void {
+  const card = peekRejoinCard();
+  if (!card) return;
+  if (rejoinTry >= REJOIN_MAX_TRIES) return;   // 由调用方给出"已回大厅"的最终文案
+  if (rejoinRetryTimer !== null) return;
+  rejoinTry++;
+  rejoinRetryTimer = window.setTimeout(() => {
+    rejoinRetryTimer = null;
+    const c = peekRejoinCard();
+    if (!c || state !== "online" || !net.connected) return;
+    requestRejoin(c.tableId, c.token);
+  }, REJOIN_RETRY_MS);
+}
 /** v2.12 主机检查点：成员保存最新一份（房主断线时凭它+本地快照接替续局） */
 let lastCheckpoint: CheckpointPlayer[] | null = null;
 /** v2.10 WebRTC P2P：双人同桌时尝试建立快照直连（失败自动回落 WS 兜底） */
@@ -261,7 +301,26 @@ let roomBotCount = 0;
 // v2.15 座位状态：每个座位可以是 "open"(开放) | "ai"(AI队友) | "closed"(关闭)
 // 房主点击空座位轮换状态：开放 → AI → 关闭 → 开放
 type SeatState = "open" | "ai" | "closed";
+/**
+ * 座位状态的**本地镜像**（v3.0.4 起服务器权威）。
+ * ⚠ 这三态不是纯 UI 偏好 —— 它决定开局时"哪些席位交给 AI"，所以只能有一个权威来源。
+ *   此前它只活在房主浏览器内存里：服务器仍按 4 座全空算，其余座位被真人占掉后房主侧
+ *   状态与实际座位错位（AI 画在真人身上 / 想留给人机的座位被真占）。
+ *   现在：房主轮换 → net.setSeat 上报 → 服务器 broadcastTable 回流 → 这里被覆写成服务器那份。
+ */
 let seatStates: SeatState[] = ["open", "open", "open", "open"];
+/** 服务器权威座位状态的落地口（唯一的写入口；本地不做任何"猜测性"修改） */
+function applyServerSeatStates(next?: readonly SeatState[]): void {
+  if (!Array.isArray(next) || next.length === 0) return;
+  const norm: SeatState[] = ["open", "open", "open", "open"];
+  for (let i = 0; i < norm.length; i++) {
+    const v = next[i];
+    if (v === "ai" || v === "closed" || v === "open") norm[i] = v;
+  }
+  seatStates = norm;
+  // 人机队友数量由**同一份状态**派生，不再由点击处各自维护（两处各改一次 = 迟早不一致）
+  roomBotCount = norm.filter((st, i) => st === "ai" && i > 0).length;
+}
 // v2.3.6：先选模式（null=模式选择中），再进该模式的房间大厅（每模式 20 桌）
 let onlineMode: "endless" | "stage" | null = null;
 let onlineModeSel = 0; // 0=无尽 1=闯关
@@ -510,19 +569,28 @@ function shareBase(roomId: number | null): { base: string; extra: string; roomIn
   return { base: "", ...noRoom }; // 拿不到任何可分享地址（无局域网网卡），由调用方提示
 }
 
-/** 生成「带房间号」邀请链接（好友打开后自动坐到本桌座位上；纯逻辑拼接见 InviteLink.buildInviteUrl）。 */
+/**
+ * 生成「带房间号」邀请链接（好友打开后自动坐到本桌座位上）。
+ * 成形规则见 InviteLink.composeInviteUrlSafe（稳定入口形态下房号在路径里、不再拼 ?room=）；
+ * 抽成纯函数是为了让这条关键行为有 **入库单测** 兜底（Issue #16 🟢，此前只活在 e2e 脚本里）。
+ * ⚠ 本函数跑在渲染热路径（renderOnline 每帧 + __tankDebug.inviteUrl）→ **绝不抛错**（评审 🟡3）：
+ *   形态校验失败只退化为空串/安全兜底，问题在出口处提示一次，不刷屏、不打断大厅渲染。
+ */
 function buildInviteUrl(roomId: number): string {
   const { base, extra, roomInPath } = shareBase(roomId);
-  // 成形规则见 InviteLink.composeInviteUrl（稳定入口形态下房号在路径里、不再拼 ?room=）；
-  // 抽成纯函数是为了让这条关键行为有 **入库单测** 兜底（Issue #16 🟢，此前只活在 e2e 脚本里）。
-  // 形态由 inviteUrlMode 从 base 推断并校验（评审打回：不再手传布尔，漏传会当场抛错而非静默畸形）。
   const mode = inviteUrlMode(base);
   if (roomInPath !== (mode === "stable-entry")) {
-    // shareBase 的标记与 base 实际形状不符 —— 立即报错，别把畸形链接发给玩家
-    throw new Error(`shareBase 形态不一致：roomInPath=${roomInPath} 但 base=${JSON.stringify(base)}`);
+    // shareBase 的标记与 base 实际形状不符：返回空串（调用方提示「拿不到可分享地址」），不发给玩家畸形链接
+    lastInviteUrlProblem = `shareBase 形态不一致：roomInPath=${roomInPath} 但 base=${JSON.stringify(base)}`;
+    return "";
   }
-  return composeInviteUrl(base, roomId, extra, mode);
+  const { url, problem } = composeInviteUrlSafe(base, roomId, extra, mode);
+  lastInviteUrlProblem = problem ?? null;
+  return url;
 }
+
+/** 最近一次邀请链接成形问题（渲染热路径上不 throws，问题憋到这里，出口处提示一次） */
+let lastInviteUrlProblem: string | null = null;
 
 /**
  * 不带房间号的「大厅链接」：好友打开后进大厅，自己选桌/开房（不占座位）。
@@ -790,7 +858,10 @@ function onlineCopyInvite(): void {
   if (!onlineCurrent) return;
   const url = buildInviteUrl(onlineCurrent.id);
   if (!url || url.includes("//localhost") || url.includes("//127.0.0.1")) {
-    notifyOnline("无法生成分享链接：未获取到本机局域网地址，请改用 http://<你的IP>:3001 打开页面");
+    // 出口处提示一次（渲染热路径上不抛错，问题在这里显式暴露，见 buildInviteUrl 注释）
+    notifyOnline(lastInviteUrlProblem
+      ? `无法生成分享链接：${lastInviteUrlProblem}`
+      : "无法生成分享链接：未获取到本机局域网地址，请改用 http://<你的IP>:3001 打开页面");
     return;
   }
   copyText(url);
@@ -1079,7 +1150,8 @@ function wireNetHandlers(): void {
     const rej = !onlineInTable ? peekRejoinCard() : null;
     if (rej) {
       notifyOnline("检测到中断的对局，正在重连…");
-      setTimeout(() => net.rejoin(rej.tableId, rej.token), 300);
+      // requestRejoin 打标：随后的 error 帧据此归到**重连**流程（不是"加入房间失败"）
+      setTimeout(() => requestRejoin(rej.tableId, rej.token), 300);
     } else if (autoJoinRoom !== null && !onlineInTable) {
       // 带房间号邀请链接 → 自动坐进该桌。
       // v2.38 修复：**不在这里写死 onlineMode**（旧版写死 "endless"，会把闯关桌的邀请
@@ -1094,15 +1166,19 @@ function wireNetHandlers(): void {
   });
   net.on("table", (table) => {
     onlineCurrent = table;
+    // v3.0.4 座位三态以服务器为权威（房主自己的轮换也走这条路回流，保证任何人看到的都同一份）
+    applyServerSeatStates(table.seatStates);
     onlineInTable = table.seats.some((s) => s && s.clientId === net.myClientId);
     // 邀请链接自动进房时，从桌信息反推模式（跳过模式选择）
     if (onlineInTable && onlineMode === null) onlineMode = table.mode;
     // 已成功坐进邀请房间（或已在别的桌内）→ 清掉待加入状态，停止重试
     if (onlineInTable) stopInviteJoin();
-    // 进入房间时重置人机队友数量和座位状态
-    if (onlineInTable) { roomBotCount = 0; seatStates = ["open", "open", "open", "open"]; }
+    // 进入房间时重置人机队友数量（座位状态已由上面的 applyServerSeatStates 按服务器权威落地）
+    if (onlineInTable) roomBotCount = 0;
   });
-  net.on("error", (m) => notifyOnline(m));
+  // ⚠ 这里曾有一条 `net.on("error", (m) => notifyOnline(m))` —— 死代码：NetClient.on() 是**覆盖**语义
+  //   （handlers[k] = cb），它被紧邻下方的统一 error handler 覆盖，恒不生效，且会误导人
+  //   以为"兜底文案"来自这里（评审 🟡2 已删）。error 帧只有下方**一个**入口。
   net.on("closed", () => {
     if (state === "online" || state === "online_host" || state === "online_client") {
       // v2.25 断线不再踢回主菜单（避免玩家误点"开始"被导流到离线单机）：
@@ -1119,45 +1195,72 @@ function wireNetHandlers(): void {
   });
   net.on("left", () => {
     onlineInTable = false; onlineCurrent = null; onlineSel = 0; roomBotCount = 0;
-    seatStates = ["open", "open", "open", "open"]; clearRejoinCard();
+    applyServerSeatStates(undefined); clearRejoinCard();
     stopInviteJoin();   // 主动离桌 = 放弃邀请链接的自动进房，留在大厅
     notifyOnline("已离开房间");
   });
   net.on("start", (start) => beginOnlineGame(start));
   net.on("rejoin_ok", (d) => {      // v2.11 局内重进成功：直接恢复对局（复用 beginOnlineGame）
+    stopRejoinRetry();                        // v3.0.4：本次重连流程收束（清标记 + 停重试）
     (window as any).__rejoinApplied = true;   // e2e 判定"已重连回对局"
     beginOnlineGame({ myIndex: d.myIndex, mode: d.mode, players: d.players, orient: d.orient });
     notifyOnline("对局重连成功，继续游戏");
   });
-  net.on("error", (msg, code) => {  // v2.11 重连令牌失效（对局已结束/座位被顶替/房主迁移）→ 清卡回大厅
-    if (peekRejoinCard()) { clearRejoinCard(); notifyOnline(`重连失败：${msg}，已回大厅`); }
-    // v2.25 大厅内连接失败（服务器未启动/重启中）→ 自动重试，不把玩家丢回主菜单
-    if (state === "online" && !net.connected) { scheduleOnlineReconnect(); return; }
-    // 加入房间失败：**按服务端机器码分档**（v2.41 / Issue #16 D1）。
-    // 旧实现用 msg.includes("已满"/"不存在"/"对局中") 判行为 —— 服务端一改文案就静默退化：
-    // 「对局中」会丢掉重试、「不存在」会退化成通用失败。现在行为只看 code（文案只做展示）。
-    // ⚠ 判据（classifyJoinError）是**与流程无关**的：它只回答"这条错误说明房间怎么了"。
-    //   "当前处在哪个流程"由下面的分支决定 —— 别再拿某一流程的结论去套另一个流程
-    //   （返工前把邀请分支的取舍套到重连场景，重连卡失败时会丢掉「要新链接」这类可操作提示）。
-    const verdict = classifyJoinError(code, msg);
-    lastJoinErrorVerdict = { kind: verdict.kind, retry: verdict.retry, via: verdict.via, msg: String(msg), roomId: autoJoinRoom ?? onlineCurrent?.id ?? null, at: Date.now() };
-    if (autoJoinRoom !== null && !onlineInTable && state === "online") {
-      // ── 流程 A：邀请链接自动进房 ──
-      const roomId = autoJoinRoom;
-      if (verdict.retry) {
-        // 唯一会重试的情形：本局进行中 → 等本局结束，重试中每次说明第几次尝试
-        notifyOnline(joinErrorText(verdict.kind, roomId));
-        scheduleInviteJoinRetry();
+  net.on("error", (msg, code, from) => {  // 服务端 error 帧的统一入口（v2.11 起；v2.42 收编决策；v3.0.4 归因）
+    // ⓪ **只认自己发起的帧**（v3.0.4）。error 帧的来源不止"我在加房间"：房间里的操作回执
+    //    （成员点「开始」/ 非房主切方向被拒）也会发给全桌。若不加这道闸，一个**在浏览大厅、
+    //    没在加任何房间**的玩家会收到队友的 host_only，然后被渲染成
+    //    「加入房间 #N 失败（仅房主可开始）」—— 与自己完全无关的一段话。
+    //    from 缺失（老服务端）时无法归因 → 按"不是我的帧"处理：宁可不弹，也不弹别人的错。
+    if (from !== undefined && from !== net.myClientId) return;
+    // ① 重连卡场景：令牌失效/对局已结束/座位被顶替 → 清卡 + 按**重连口径**渲染，然后 return。
+    //    返工前这里只说 `重连失败：${msg}，已回大厅`，紧接着又被下方流程 B 的"加入房间失败（…）"
+    //    整条盖掉 —— 玩家看不到"已回到大厅"。现在渲染完就 return，不会被覆盖。
+    const rej = rejoinRequested ? peekRejoinCard() : null;
+    if (rej) {
+      const wasRejoining = rejoinRequested;
+      clearRejoinCard();
+      stopRejoinRetry();
+      if (wasRejoining) {
+        // 是"我方 rejoin 的结论" → 按重连口径出一句，**绝不留在这条路径上空转**
+        notifyOnline(decideErrorFrame(code, msg, { rejoining: true, roomId: rej.tableId, rawMsg: String(msg) }).text);
       } else {
-        // 已满 / 不存在 / 未知错误 → 一次定性，不空转重试（v2.38 起的行为，v2.41 改为按码判定）
-        stopInviteJoin();
-        notifyOnline(inviteJoinErrorText(verdict.kind, roomId, msg));
+        // 不是 rejoin 的结论（对局中服务器主动发的错误帧，最常见的是"该对局进行中，接不回去"）
+        // → 别当成"加入房间失败"，而是**再试一次重连**（有界），失败到顶再由上面那句话收尾。
+        if (rejoinTry < REJOIN_MAX_TRIES) {
+          scheduleRejoinRetry();
+        } else {
+          notifyOnline(decideErrorFrame(code, msg, { rejoining: true, roomId: rej.tableId, rawMsg: String(msg) }).text);
+        }
       }
-    } else if (!onlineInTable && state === "online") {
-      // ── 流程 B：留在大厅时的其它错误（重连卡已在上方消费掉；这里只兜"玩家点桌 / 服务器拒绝"）──
-      // 文案同样由 verdict.kind 驱动（不手写 "playing"），reason 取不到时退回服务端原文。
-      if (verdict.retry) notifyOnline(joinErrorText(verdict.kind, onlineCurrent?.id ?? null));
-      else notifyOnline(joinErrorText(verdict.kind, onlineCurrent?.id ?? null, msg));
+      return;
+    }
+    // ② 大厅内连接失败（服务器未启动/重启中）→ 自动重试，不把玩家丢回主菜单
+    if (state === "online" && !net.connected) { scheduleOnlineReconnect(); return; }
+    // ③ 其它错误帧：**先记判定**（e2e 断言"行为由机器码决定，不靠中文文案"），再按流程处置。
+    const isInviteJoin = autoJoinRoom !== null && !onlineInTable && state === "online";
+    const isLobbyError = !onlineInTable && state === "online";
+    if (!isInviteJoin && !isLobbyError) return;
+    // 流程由入参表达，文案口径由 decideErrorFrame 单点决定 —— 不再把「邀请进房」的结论套到大厅场景
+    // （返工前 host_only / start_precondition / no_rejoin 会被说成"加入房间失败"，与语义矛盾）。
+    const d = isInviteJoin
+      ? decideErrorFrame(code, msg, { attemptJoin: true, roomId: autoJoinRoom, rawMsg: String(msg) })
+      : decideErrorFrame(code, msg, { attemptJoin: false, roomId: onlineCurrent?.id ?? null, rawMsg: String(msg) });
+    lastJoinErrorVerdict = { kind: d.kind, retry: d.retry, via: d.via, msg: String(msg), roomId: isInviteJoin ? autoJoinRoom : (onlineCurrent?.id ?? null), at: Date.now() };
+    if (d.retry) {
+      // 唯一会重试的情形：邀请的房间本局进行中 → 等本局结束（重试中每次说明第几次尝试）。
+      // ⚠ 这条重试**只对邀请流程成立**（v3.0.4）：`room_playing` 是流程无关的码 ——
+      //   它同时表示「我加不进去」和「我接不回那局」。后者由 ① 的重连分支消费（那里有卡、
+      //   会清卡并 return），永远走不到这里；所以这里的重试只可能是"邀请链接进房"。
+      notifyOnline(d.text);
+      scheduleInviteJoinRetry();
+    } else {
+      if (isInviteJoin) stopInviteJoin();     // 已满 / 不存在 / 未知 → 一次定性，不空转重试
+      // 🟡4：大厅里点桌遇到「本局进行中」不重试（重试只对邀请流程生效）→ 文案不能暗示"正在等本局结束"，
+      // 否则玩家以为系统会自动带他进去。这里改成"稍后自己再点一次"的明确指引。
+      notifyOnline(!isInviteJoin && d.kind === "playing"
+        ? "该房间对局中：请等本局结束后再点一次进桌"
+        : d.text);
     }
   });
   net.on("peerInput", (msg) => { if (host && msg.idx === 1) { host.enqueueRemoteInput(msg.flags, msg.clientFrame ?? 0, msg.clientSendTime ?? Date.now()); host.lastPeerInputTime = msg.clientSendTime ?? Date.now(); } });
@@ -1245,6 +1348,13 @@ function beginOnlineGame(start: { myIndex: number; mode: "endless" | "stage"; pl
     seatStates.forEach((st, i) => { if (st === "ai" && i > 0) aiSeats.push(i); });
     const combatPlayers = Math.min(4, Math.max(1, start.players.length + aiSeats.length));
     host = new OnlineHostMode(canvas, layout, combatPlayers, aiSeats);
+    // v3.0.4 淘汰判据只看真人席位：`start.players` 的索引就是玩家索引（座位下标≠玩家索引，
+    // 所以不能用座位下标）。房主自己永远是 0；其余在座真人按 players 顺序落位。
+    // AI 席位不进来 —— 它们不该替玩家续命（否则 4 人局里"全员阵亡"永远不成立）。
+    host.humanSeats = start.players.map((_, i) => i).filter((i) => i === 0 || !aiSeats.includes(i));
+    // v3.0.4 座位上的操作者姓名（主机侧渲染每个席位用）：以前只有 P1/P2 有名字，
+    //   3/4 号位即使坐着真人也被画成「P3」「P4」——"本地双人"观感残留。
+    host.seatNames = start.players.map((p) => p.name ?? "");
     // v2.15 AI队友：房间内开启人机队友后，P2 由 AI 接管（无远端玩家时）
     if (roomBotCount > 0) {
       // 如果座位1是AI，设置P2 AI
@@ -1783,12 +1893,11 @@ function renderOnline(W: number, H: number): void {
         // 房主点击空座位轮换状态：开放 → AI → 关闭 → 开放
         if (isHost) {
           lobbyButtons.push({ x: seatX, y: seatY, w: seatW, h: seatH, onTap: () => {
+            // 轮换顺序：开放 → AI → 关闭 → 开放。**只上报**，不本地改（服务器回流后统一生效，
+            // 否则房主看到的与服务器记录的分叉 = 本文件 v3.0.4 要修的那个错位）
             const cur = seatStates[i];
-            if (cur === "open") seatStates[i] = "ai";
-            else if (cur === "ai") seatStates[i] = "closed";
-            else seatStates[i] = "open";
-            // 同步更新 roomBotCount（AI座位数量）
-            roomBotCount = seatStates.filter(st => st === "ai").length;
+            const next: SeatState = cur === "open" ? "ai" : cur === "ai" ? "closed" : "open";
+            net.setSeat(i, next);
             getSoundManager().play("pickup");
           }});
         }
@@ -1929,8 +2038,10 @@ function renderOnline(W: number, H: number): void {
       drawLobbyButton(bx + btnW + gap, mainRowY, btnW, mainRowH, "▶ 开始游戏 (S)",
         "#221a05", "#fd0", "#ffd75e", onlineStartGame);
     } else {
+      // 非房主的开始位是**死按钮**（点了没有回执，而 S 键却会发帧、被服务器以 host_only 拒绝）。
+      // v3.0.4 就地提示：谁按了、为什么没用，当场说清，不必等服务端绕一圈。
       drawLobbyButton(bx + btnW + gap, mainRowY, btnW, mainRowH, "等待房主开始…",
-        "#181818", "#333", "#777", () => {});
+        "#181818", "#333", "#777", () => notifyOnline("只有房主可以开始对局，等房主点「开始游戏」即可"));
     }
     drawLobbyButton(bx + (btnW + gap) * 2, mainRowY, btnW, mainRowH, "← 离开房间",
       "#21100f", "#f66", "#faa", onlineLeaveTable);

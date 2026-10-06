@@ -8,7 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "online": "node server/index.mjs",
-    "test": "vitest run && npm run net:entry-test",
+    "test": "vitest run && npm run net:entry-test && npm run net:server-test",
     "test:watch": "vitest",
     "test:debug": "vitest run --inspect-brk --no-file-parallelism",
     "dual": "node scripts/quick-dual-test.mjs",
@@ -17,8 +17,9 @@
     "net:latency": "node scripts/net-latency.mjs",
     "deploy:server": "bash deploy/start-server.sh",
     "net:entry-test": "node --test src/net/entry-match.test.mjs",
+    "net:server-test": "node --test src/net/server-access.test.mjs",
     "typecheck": "tsc --noEmit",
-    "verify": "npx tsc --noEmit && npm run build && npx vitest run && npm run net:entry-test",
+    "verify": "npx tsc --noEmit && npm run build && npx vitest run && npm run net:entry-test && npm run net:server-test",
     "test:local": "sh scripts/e2e/run-verify.sh"
   },
   "dependencies": {

@@ -63,7 +63,8 @@
 # ── CI 门禁：纯校验，不起常驻服务、不下载浏览器 ──
 # 触发：pull_request（PR 创建/重新打开/源分支 push）→ 每个 PR 都有一道门。
 # 取 4 核（默认 8 核 16G 属"高负载"，本仓库门禁是纯 CPU 轻活，省核）→ 对齐用户"云 CPU 不够用"。
-# 跑什么：npm ci → tsc → vite build → vitest → net:entry-test（纯 node --test，自起服务器自选随机端口）。
+# 跑什么：npm ci → tsc → vite build → vitest → net:entry-test → net:server-test
+#         （后两条都是纯 node --test：自起服务器、自选随机端口，不下浏览器、不起常驻服务）。
 # 不跑什么：真机 e2e（要下 Chromium ~400MB + 三个服务）、延迟实测 —— 那是**本地**的事。
 main:
   pull_request:
@@ -84,6 +85,14 @@ main:
       - name: stable-entry-regression
         # 稳定入口 + error 帧机器码的回归锁（真起服务器、真发 HTTP/WebSocket，随机端口）
         script: npm run net:entry-test
+      - name: server-access-regression
+        # 【为什么必须有这一条（评审 🔴：CI 的准入锁曾是假锁）】
+        #   net:entry-test 是**本地**工具（它要下 Chromium 那套 e2e 环境），云端被跳过；
+        #   于是"谁能在什么状态下做什么"（座位容量 / 发起者归属 / 重连与加入的分工）
+        #   在 CI 里**完全没有门禁** —— 服务端改坏了 PR 照样绿。
+        #   本阶段是纯 node --test：自起 server/index.mjs（随机端口）+ 真发 WebSocket，
+        #   不下浏览器、不起常驻服务，几秒跑完，适合云端。
+        script: npm run net:server-test
 # 说明：不再为 `pull_request.update` 再挂一条重复流水线 —— 门禁只跑一条，
 # 改标题/描述不需要重跑构建（省云 CPU）。要手动重跑，用 PR 页面的「重新构建」。
 

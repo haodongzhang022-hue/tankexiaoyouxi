@@ -19,6 +19,7 @@ import { EMPTY_INPUT } from "../engine/InputManager";
 import { SyncCodec } from "../../net-sync-core/core";
 import type { SyncState } from "../../net-sync-core/core";
 import { TANK_SYNC_SCHEMA, netSnapshotToState } from "../../net-sync-core/adapters/tank-adapter";
+import { isAllHumanPlayersDead } from "../utils/GameOver";
 import type {
   NetSnapshot, NetTank, NetProjectile, NetLootDrop, NetPowerUp, NetLvlChoice, CheckpointPlayer, NetWarehouse,
 } from "../net/NetTypes";
@@ -146,6 +147,23 @@ export class OnlineHostMode extends GameModeCore {
     this.spawnSystem.continuous = true;
     this.spawnSystem.onWaveComplete = () => { this.wave++; };
   }
+  /**
+   * v3.0.4 渲染后补标操作者姓名（1~4 人局）。
+   * 为什么放在这层：主机画面上只有坦克 + 编号，房间里的 3/4 号位真人和 AI 席位长得一样，
+   * 而联机的一切操作（发快照、认升级面板、看复活进度）都按玩家索引走 —— 能让玩家对上的
+   * 唯一线索就是名字，所以名字必须画在坦克上，而不是只活在大厅列表里。
+   */
+  protected renderPlayersExtra(renderer: Renderer): void {
+    for (let pi = 0; pi < this.players.length; pi++) {
+      const name = (this.seatNames[pi] ?? "").slice(0, 8);
+      if (!name) continue;
+      const p = this.players[pi];
+      if (!p.isAlive) continue;
+      renderer.drawText(name, Math.round(p.x), Math.round(p.y) - 20,
+        { font: "10px monospace", color: pi === 0 ? "#9df" : "#cfc", align: "center" });
+    }
+  }
+
   protected handleExtraInput(_i1: unknown, _i2: unknown, _dt: number): void {
     // P1/P2 切炮已在 GameModeCore.updateBattle 统一边沿检测（含远端输入的 switchCannon 标志）
   }
@@ -153,7 +171,14 @@ export class OnlineHostMode extends GameModeCore {
     this.isOver = true; this.gameOverReason = "base";
     getSoundManager().play("game_over");
   }
+  /**
+   * v3.0.4 淘汰判据（覆盖）：1~4 人联机局里只要有 AI 席位还活着，"全员阵亡"就永远不成立
+   * —— `isTeamEliminated` 问的是"整支队伍"，单机语义正确，搬到联机里等于"永远输不了"，
+   * 玩家感知就是"我死光了但游戏不结束"。这里只判**真人席位**（humanSeats，由 main 开局写入）：
+   * 他们全部既不在场也没有命可复活 → 本局结束；AI 席位不替玩家续命。
+   */
   protected onTeamEliminated(): void {
+    if (!isAllHumanPlayersDead(this.players, this.humanSeats)) return;
     this.isOver = true; this.gameOverReason = "team";
     getSoundManager().play("game_over");
   }
@@ -397,6 +422,21 @@ export class OnlineHostMode extends GameModeCore {
     if (playerIdx < 0 || playerIdx >= this.players.length) return;
     this.buyFromShop(playerIdx, choice);
   }
+
+  /**
+   * v3.0.4 由**真人**操作的席位索引（玩家索引；房主固定含 0）。
+   * 由 main 在开局时按 `start.players` 写入 —— 用于淘汰判据：只看真人席位，
+   * AI 席位（3/4 号 AI、P2 由 AI 接管）不替玩家续命。
+   */
+  humanSeats: number[] = [0];
+
+  /**
+   * v3.0.4 每个席位的**操作者姓名**（索引 = 玩家索引；空串 = 无名字，如 AI 席位）。
+   * 由 main 在开局时按 `start.players` 写入，渲染时标在坦克上方 ——
+   * 以前只有 P1/P2 有"名字"概念，3/4 号位的真人在主机画面上就是「P3」「P4」，
+   * 而"人头替"（房主断线接替）还会换人，只报编号根本认不出谁是谁。
+   */
+  seatNames: string[] = [];
 
   /** v2.15 简化：每帧直接应用队列中最新的远端输入，不再用固定步进（修复P2不能移动/被拉回的bug） */
   private consumeRemoteInputQueue(dt: number): void {
