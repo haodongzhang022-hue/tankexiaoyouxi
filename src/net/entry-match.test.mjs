@@ -842,9 +842,14 @@ test("🔴 回归（Issue #16 D1/🔴1）：错误帧决策入口按流程分档
       assert.doesNotMatch(d.text, /加入房间/, `${c} 不得被渲染成"加入房间失败"`);
     }
   }
-  // ② 大厅里点桌遇到「本局进行中」：文案不得暗示会自动等本局结束（重试只对邀请流程生效，评审 🟡4）
+  // ② 大厅里点桌遇到「本局进行中」：**不重试**（重试只对"邀请链接自动进房"成立，评审 🟡4），
+  //    文案也不得暗示会自动等本局结束
   const lobbyPlaying = fe.decideErrorFrame("room_playing", "该房间对局中", { attemptJoin: false, roomId: 7, rawMsg: "该房间对局中" });
-  assert.ok(lobbyPlaying.retry === true, "playing 判据本身仍标记为「值得重试」（调用方决定要不要真重试）");
+  assert.equal(lobbyPlaying.kind, "playing", "分档本身仍要认得出「对局中」（玩家要知道真实原因）");
+  assert.equal(lobbyPlaying.retry, false,
+    "大厅点桌 / 重连结论：attemptJoin=false 时连 playing 也不许重试（否则就是无限重试回路）");
+  // 只有"真的在加房间"时 playing 才值得重试（等本局结束再点一次）
+  assert.equal(fe.decideErrorFrame("room_playing", "x", { attemptJoin: true, roomId: 7, rawMsg: "x" }).retry, true);
   // ③ 重连卡场景：必须渲染出"已回到大厅"，且不是邀请/加入房间口径（评审 🔴1）
   for (const [code, raw] of [["no_rejoin", "重连令牌无效或已失效"], ["room_full", "房间已满"], ["room_not_found", "房间不存在"]]) {
     const r = fe.decideErrorFrame(code, raw, { rejoining: true, roomId: 12, rawMsg: raw });

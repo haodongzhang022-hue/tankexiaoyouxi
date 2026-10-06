@@ -15,6 +15,13 @@ export interface NetTable {
   seats: Array<{ clientId: number; name: string; ready: boolean } | null>;
   /** v2.35 房间方向（房主开局时决定的地图/画面方向；成员进入后按此适配布局） */
   orient?: "landscape" | "portrait";
+  /**
+   * v3.0.4 座位状态（服务器权威）：`open` 开放｜`ai` 房主预留给人机｜`closed` 房主关闭。
+   * 房主在大厅点座位轮换 → `net.setseat` 上报 → 服务器广播回流，全员（含房主自己）渲染同一份。
+   * ⚠ 这份状态**不是**纯 UI 偏好：它参与开局时"哪些席位由 AI 接管"的实际语义，
+   *   所以只能有一个权威来源（服务器），不能是房主浏览器的本地内存。
+   */
+  seatStates?: Array<"open" | "ai" | "closed">;
 }
 
 // ── 服务端 → 客户端 ──
@@ -46,7 +53,15 @@ export interface GameOverMsg { t: "gameover"; info: { reason: string; score: num
 /** v2.41（Issue #16 D1）error 帧：`code` 是机器码（见 shared/net-error-codes.mjs），
  *  客户端**按 code 决定行为**（能不能重试），`msg` 只用于展示。
  *  `code` 为可选：旧服务端没有它，客户端回落到关键词兜底（见 src/net/JoinError.ts）。 */
-export interface ErrorMsg { t: "error"; code?: string; msg: string; }
+export interface ErrorMsg {
+  t: "error"; code?: string; msg: string;
+  /**
+   * v3.0.4 发起者 clientId：服务器会把「房间内某人的操作被拒」的 error 帧一并广播给同桌所有人
+   * （操作回执对当事人可见 = 好事），但**只有发起者本人**该把它当成"我这次操作失败"渲染。
+   * 可选：老服务端无此字段，客户端只能按"无法归因"处理（不弹别人的错）。
+   */
+  from?: number;
+}
 export interface LeftMsg { t: "left"; }
 /** 服务器 RTT 探测回包：ts 为客户端发起时的原时间戳（ping / input 携带 clientSendTime 均触发），RTT = Date.now() - ts */
 export interface PongMsg { t: "pong"; ts: number; }

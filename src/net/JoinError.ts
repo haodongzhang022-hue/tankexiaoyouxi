@@ -191,9 +191,15 @@ export function decideErrorFrame(code: unknown, msg: unknown, ctx: ErrorFrameCon
   } else {
     text = inviteJoinErrorText(v.kind, roomId, raw);
   }
-  // 重试 == 判据说的"本局进行中"（等本局结束再点一次）。非加入错误的码判不出 playing，
-  // 因此天然不会重试；不需要额外门闸（也不该有 —— classifyJoinError 的 retry 口径是权威）。
-  const retry = v.retry;
+  // 重试 == 判据说的"本局进行中"（等本局结束再点一次），**且**这次真的在加房间。
+  //
+  // ⚠ 为什么"在加房间"这个门闸不能省（v3.0.4，评审实测的无限重试回路）：
+  //   服务端的码是**流程无关**的 —— 同一个 `room_playing` 既可能来自 join（我加不进这张桌），
+  //   也可能来自 rejoin（我接不回那一局）。只看码的话，第二种情况会被判成"等本局结束就能进"，
+  //   于是重连失败 → 排 3 秒后重试 → 再失败 → …… 玩家在局内断线后永远回不到大厅，后台却一直在连。
+  //   重连场景的重试由调用方的**有界**重连重试负责（见 main.ts requestRejoin/scheduleRejoinRetry），
+  //   这里返回 false：重连失败就是"回大厅"，不是"等一会儿再进"。
+  const retry = v.retry && (ctx.rejoining === true ? false : ctx.attemptJoin !== false);
   return { kind: v.kind, isJoinFailure, retry, stopFlow: ctx.attemptJoin === true && !retry, text, via: v.via, frameKind: kindOfFrame };
 }
 

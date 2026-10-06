@@ -1703,11 +1703,18 @@ export abstract class GameModeCore {
       if (this.camera.isVisible(e.x, e.y)) e.render(renderer, now);
     }
     for (const p of this.players) p.render(renderer, now);
+    this.renderPlayersExtra(renderer);      // v3.0.4 子类钩子（联机：把操作者姓名标在每个席位上）
     this.droneSystem.render(renderer.ctx);
     this.renderSpawnWarnings(renderer, now);
     this.renderDroppedCannons(renderer);
     this.camera.restoreCtx(renderer.ctx);
   }
+
+  /**
+   * v3.0.4 玩家渲染后的补充钩子（默认空实现）。
+   * 联机主机用它把**操作者姓名**标在每个席位上：1~4 人局里只画「P1/P2」认不出谁是谁。
+   */
+  protected renderPlayersExtra(_renderer: Renderer): void { /* override */ }
 
   /** v2.26 小人头顶"商店刷新倒计时"周期指示器；v2.27 增加沙漏图形（不看数字也能一眼看出剩余） */
   private renderHandymanShopTimer(renderer: Renderer): void {

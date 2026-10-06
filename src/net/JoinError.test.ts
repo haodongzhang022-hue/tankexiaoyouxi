@@ -188,9 +188,13 @@ describe("decideErrorFrame：文案口径 + 是否重试单点决定", () => {
   });
 
   it("重试只在「加房间 + 本局进行中」时成立（非加入错误不得空转重试）", () => {
-    expect(decideErrorFrame(ERR_ROOM_PLAYING, "对局中", { attemptJoin: false, rawMsg: "对局中" }).retry).toBe(true);
-    expect(decideErrorFrame(ERR_ROOM_PLAYING, "对局中", { attemptJoin: false, rawMsg: "对局中" }).stopFlow).toBe(false);
+    // attemptJoin 省略 = "只有码本身说明是加入错误才算"（大厅里点桌 / 邀请进房都用它）
+    expect(decideErrorFrame(ERR_ROOM_PLAYING, "对局中", { rawMsg: "对局中" }).retry).toBe(true);
+    expect(decideErrorFrame(ERR_ROOM_PLAYING, "对局中", { rawMsg: "对局中" }).stopFlow).toBe(false);
     expect(decideErrorFrame(ERR_HOST_ONLY, "仅房主", { attemptJoin: false, rawMsg: "仅房主" }).retry).toBe(false);
+    // ⚠ attemptJoin:false 是**明说"这次不是在加房间"** → 连 playing 也不许重试
+    //   （这是修掉「重连失败 → 3s 一次无限重试」的那道闸，见下方归属用例）
+    expect(decideErrorFrame(ERR_ROOM_PLAYING, "对局中", { attemptJoin: false, rawMsg: "对局中" }).retry).toBe(false);
   });
 
   it("重连文案出口与 rejoinErrorText 一致（同一句话只有一处定义）", () => {
@@ -249,5 +253,35 @@ describe("frameKindOfCode：展示口径由码单点决定（真查 NOT_ADD_ERRO
     expect(decideErrorFrame(ERR_HOST_ONLY, "仅房主", { attemptJoin: true, rawMsg: "仅房主" }).frameKind).toBe("not_add");
     expect(decideErrorFrame(ERR_ROOM_FULL, "已满", { attemptJoin: true, rawMsg: "已满" }).frameKind).toBe("join");
     expect(decideErrorFrame("x", "原文", { attemptJoin: true, rawMsg: "原文" }).frameKind).toBe("join");
+  });
+});
+
+// ── 评审 🔴（v3.0.4）：error 帧的**归属**必须由发起动作决定，不能只看机器码 ──
+// 为什么这条要在单测里钉：服务端错误码是**流程无关**的 —— 同一个 `room_playing` 既可能是
+// "我加不进这张桌"（join），也可能是"我接不回那一局"（rejoin）。v2.42 把"值得重试"的结论
+// 按邀请流程套给了所有房间内错误，于是"重连一个进行中的对局"被当成"邀请进房值得重试"，
+// 3 秒一次无限重试，永远不可能成功（实测：起服务器 + 真发 rejoin 可复现）。
+describe("🔴 错误帧归属：同一个码在加入/重连两条流程里必须得出不同结论", () => {
+  it("room_playing 作为**加入**错误 → 值得重试（等本局结束再点一次）", () => {
+    const d = decideErrorFrame(ERR_ROOM_PLAYING, "该房间对局中", { attemptJoin: true, roomId: 7, rawMsg: "该房间对局中" });
+    expect(d.retry).toBe(true);
+    expect(d.text).not.toContain("已回到大厅");   // 加入流程的文案不该出现重连语义
+  });
+
+  it("room_playing 作为**重连**结论 → 绝不可重试，且必须说清「已回到大厅」", () => {
+    const d = decideErrorFrame(ERR_ROOM_PLAYING, "该房间对局中", { rejoining: true, roomId: 7, rawMsg: "该房间对局中" });
+    // ★ 关键：重连场景的重试必须是 false —— 否则就是本次修的无限重试回路
+    expect(d.retry).toBe(false);
+    expect(d.text).toContain("已回到大厅");
+    expect(d.text).not.toContain("加入房间");
+    expect(d.stopFlow).toBe(false);              // 重连没有"进房流程"要停
+  });
+
+  it("重连分支优先于邀请分支（调用方按 rejoining 先判，不看 autoJoinRoom）", () => {
+    // 这条锁的是调用顺序契约：只要带 rejoining，文案就必须是重连口径，
+    // 无论此刻是否还挂着某个 autoJoinRoom（重连卡与邀请链接可能同时存在）。
+    const rejoin = decideErrorFrame(ERR_NO_REJOIN, "重连令牌无效或已失效", { rejoining: true, roomId: 12, rawMsg: "重连令牌无效或已失效" });
+    expect(rejoin.text).toContain("已回到大厅");
+    expect(rejoin.text).toContain("重连令牌无效或已失效");
   });
 });
